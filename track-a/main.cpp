@@ -321,7 +321,6 @@ struct Worker {
 Worker workers[MAX_THREADS]; // zero pages, faulted in by their own threads
 unsigned threads, neps;
 std::vector<uint16_t> sorted_ids; // output order -> endpoint id
-uint16_t rank_of[MAX_EP];         // endpoint id -> output order
 int by_size[HOURS];               // hours, largest first
 struct Stat {
   uint32_t n, errors, p[3];
@@ -338,8 +337,6 @@ void merge() {
   std::sort(sorted_ids.begin(), sorted_ids.end(), [](uint16_t a, uint16_t b) {
     return dict.name(a) < dict.name(b);
   });
-  for (unsigned k = 0; k < neps; ++k)
-    rank_of[sorted_ids[k]] = uint16_t(k);
   // Hour sizes, rounded up to whole blocks, schedule phase 2.
   size_t lines[HOURS] = {};
   for (int h = 0; h < HOURS; ++h) {
@@ -357,31 +354,31 @@ void aggregate(Worker &me, int h) {
   std::fill_n(err, neps, 0);
   for (unsigned t = 0; t < threads; ++t)
     workers[t].each_record(h, [&](uint64_t r) {
-      unsigned g = rank_of[r & 2047];
-      ++cnt[g];
-      err[g] += r >> 11 & 1;
+      ++cnt[r & 2047];
+      err[r & 2047] += r >> 11 & 1;
     });
   uint32_t acc = 0;
   for (unsigned g = 0; g < neps; ++g)
     off[g] = acc, acc += cnt[g];
   for (unsigned t = 0; t < threads; ++t)
     workers[t].each_record(h, [&](uint64_t r) {
-      v[off[rank_of[r & 2047]]++] = uint32_t(r >> 12);
+      v[off[r & 2047]++] = uint32_t(r >> 12);
     });
   // Line: 21-byte hour stamp with its space, name, six numbers each after a
   // space, newline.
   size_t bytes = 0;
-  for (unsigned g = 0; g < neps; ++g) {
-    uint32_t n = cnt[g];
+  for (unsigned g = 0; g < neps; ++g) { // g: output order
+    unsigned id = sorted_ids[g];
+    uint32_t n = cnt[id];
     if (!n)
       continue;
-    uint32_t *vg = v + off[g] - n; // off[g] now marks the end of group g
+    uint32_t *vg = v + off[id] - n; // off[id] now marks the end of the group
     uint32_t rank[3] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1,
                         (99 * n + 99) / 100 - 1};
     Stat &s = stats[h * MAX_EP + g];
-    s = {n, err[g], {}};
+    s = {n, err[id], {}};
     select(vg, 0, n, rank, 3, s.p);
-    bytes += 28 + dict.lens[sorted_ids[g]] + digits(n) +
+    bytes += 28 + dict.lens[id] + digits(n) +
              digits(s.p[0]) + digits(s.p[1]) + digits(s.p[2]) +
              digits(s.errors) +
              digits(uint32_t(uint64_t(s.errors) * 1000000 / n));

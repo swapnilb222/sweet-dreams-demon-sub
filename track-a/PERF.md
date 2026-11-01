@@ -154,6 +154,29 @@ Board experiments prepared and validated (17/17), because they hinge on kernel b
 
 Verification for step 6: 17 datasets byte-identical, 3 runs each; ThreadSanitizer and ASan/UBSan clean on 13 small and medium inputs; `check.py` passes.
 
+## Step 6 on the board, and step 7 (2026-11-01)
+
+**Board run `run-d74d8f6c4bd8`** (commit `c07a262b`, pushed 2026-11-01 05:17:53Z): **T 19.544 ms, M 23.38 MB, S 426, K 47.10, 83.65 points.** Taken from the board's public feed (`teams[].tracks.a.latest`). The step 6 cost model had predicted ~19.4 ms.
+
+The public feed keeps only each team's best and latest run, so the IDs for steps 4 and 5 cannot be recovered from it. They are on the board's per-commit results and will be added here. Every push from now on cites its ID.
+
+Step 7 (cachegrind, full seed 1, one thread):
+
+| Change | Ir (M) | Mispredicts (M) | Lines | Board run |
+|---|---:|---:|---:|---|
+| Step 6 (`run-d74d8f6c4bd8`) | 599.2 | 1.69 | 426 | 19.544 ms / 23.38 MB |
+| Phase 2 counts and scatters by raw endpoint id and walks `sorted_ids` only when emitting stats; `rank_of[]` removed (one dependent load fewer on each of 6.2M record visits) | 594.1 | 1.67 | 422 | pending |
+
+Ideas reviewed but not built:
+
+- **Stats stored in an hour's dead record blocks.** A `Stat` (20-24 B) needs 5-6x a record's 4 B, so an hour with few lines but many endpoints would not fit, and an overflow path is needed. Stats inside the pool would also stop the pool being released before phase 3, putting records (12.4 MB) alongside the 10 MB of output page cache, a higher peak than now. Avoiding that needs a copy after freeing scratch, plus another barrier. Net estimate about +0.5% K for about 35 lines.
+- **Vectorised name copy** that overruns into the next line: about 1.3M Ir. It needs a safe path at every hour's last line, because a different thread writes the neighbouring hour concurrently.
+- **Division-free itoa:** about 7-15M Ir (1-2%) at real correctness risk. Not built yet.
+
+Board experiments, regenerated on step 7 and validated 17/17: `dev/board_exp_nomadvise_candidate.cpp` (no per-chunk `MADV_DONTNEED`) and `dev/board_exp_pread_candidate.cpp` (no input mapping).
+
+Verification for step 7: 17 datasets, 3 runs; ThreadSanitizer and ASan/UBSan clean on 10 small and medium inputs; `check.py` passes.
+
 ## Protocol and evidence
 
 - Full seed-1 input: 3,100,000 records, 238,836,234 bytes.
