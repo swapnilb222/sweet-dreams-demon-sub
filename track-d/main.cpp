@@ -46,14 +46,6 @@ static void par(const std::function<void(unsigned)> &f) {
   gate->arrive_and_wait();
 }
 static u32 share(u32 n, unsigned t) { return u32(u64(n) * t / NT); }
-// Hands share t of k of [p, p + bytes) back to the kernel, so exit does not
-// have to tear the whole address space down on one thread.
-static void drop(const void *p, size_t bytes, unsigned t = 0, unsigned k = 1) {
-  uintptr_t a = (uintptr_t(p) + bytes * t / k + 4095) & ~uintptr_t(4095),
-            b = (uintptr_t(p) + bytes * (t + 1) / k) & ~uintptr_t(4095);
-  if (a < b)
-    madvise(reinterpret_cast<void *>(a), b - a, MADV_DONTNEED);
-}
 
 // Edge word: head in the low HB bits, weight above; an all-ones weight means
 // the real weight is in the slot's escape table.
@@ -173,7 +165,6 @@ static Csr read_graph(const std::string &path, u32 &n,
         b.heavy[k].push_back(w), w = WM;
       cur[k]->x[at[k]] = v | w << HB, cur[k]->lo[at[k]++] = uint16_t(u & PM);
     }
-    drop(text, size, t, NT); // its pages stay in the page cache
   });
   std::vector<u32> base(parts + 1, 0);
   for (u32 k = 0; k < parts; ++k) {
@@ -278,15 +269,23 @@ struct Region {
 static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
                    const std::vector<u64> &bypass, Csr &rv) {
   auto skip = [&](u32 v) { return bypass[v >> 6] >> (v & 63) & 1; };
-  // Claims are atomic, so every node gets exactly one new id and the count
-  // never grows past the head field.
+  // Claims race without locked instructions, so a racing store can lose a bit
+  // and a node can be claimed twice. The extra copy is harmless (heads resolve
+  // through one id entry, so no edge reaches it), unless the copies push the
+  // node count past the head field or a thread's edge buffer: then the pass
+  // reruns with atomic claims.
   std::vector<std::atomic<u64>> taken((n >> 6) + 1);
   std::vector<Region> reg(NT);
+  std::vector<u32> vs(NT + 1, 0), es(NT + 1, 0);
+  for (bool exact = false, full = false;; exact = true, full = false) {
   par([&](unsigned t) {
     auto claim = [&](u32 v) {
-      u64 bit = u64(1) << (v & 63);
-      return !(taken[v >> 6].load(std::memory_order_relaxed) & bit) &&
-             !(taken[v >> 6].fetch_or(bit, std::memory_order_relaxed) & bit);
+      u64 bit = u64(1) << (v & 63), w = taken[v >> 6].load(std::memory_order_relaxed);
+      if (w & bit)
+        return false;
+      if (exact)
+        return !(taken[v >> 6].fetch_or(bit, std::memory_order_relaxed) & bit);
+      return taken[v >> 6].store(w | bit, std::memory_order_relaxed), true;
     };
     Region &r = reg[t];
     r.ord.reserve(n / NT + n / NT / 4), r.deg.reserve(r.ord.capacity());
@@ -328,6 +327,8 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
           if (i + BATCH < r.ord.size())
             __builtin_prefetch(&g.adj[g.off[r.ord[i + BATCH]]]);
           u32 from = j;
+          if (j + g.off[r.ord[i] + 1] - g.off[r.ord[i]] > g.off[n])
+            return void(full = true); // copies overran the edge buffer
           for (u32 u = r.ord[i], e = g.off[u]; e < g.off[u + 1]; ++e) {
             u32 x = g.adj[e], v = x & HM;
             if (v == u)
@@ -370,11 +371,17 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
       }
     }
   });
-  g = {};
-  std::vector<u32> vs(NT + 1, 0), es(NT + 1, 0);
   for (unsigned t = 0; t < NT; ++t)
     vs[t + 1] = vs[t] + u32(reg[t].ord.size()),
            es[t + 1] = es[t] + reg[t].m;
+  if (vs[NT] <= HM + 1 && !full)
+    break;
+  for (auto &w : taken)
+    w = 0;
+  for (auto &r : reg)
+    r = {};
+  }
+  g = {};
   auto id = buf<u32>(n);
   par([&](unsigned t) {
     for (u32 i = 0; i < reg[t].ord.size(); ++i)
@@ -596,17 +603,11 @@ int main(int argc, char **argv) {
             [&](u32 a, u32 b) { return qs[a] < qs[b]; });
   std::vector<int64_t> ans(qs.size());
   std::atomic<size_t> next{0};
-  u32 m = fwd.off[n];
-  par([&](unsigned t) {
+  par([&](unsigned) {
     // Never freed: unmapping while other threads search would stall them.
     Solver &solver = *new Solver(fwd, rev, n);
     for (size_t k; (k = next++) < qs.size();)
       ans[order[k]] = solver.solve(qs[order[k]].first, qs[order[k]].second);
-    gate->arrive_and_wait(); // every search is done
-    for (Side *s : {&solver.f, &solver.b})
-      drop(s->pool.get(), s->dir.size() * s->PG * 8);
-    for (const Csr *g : {&fwd, &rev})
-      drop(g->off.get(), (n + 1) * 4, t, NT), drop(g->adj.get(), m * 4, t, NT);
   });
   FILE *file = fopen((out + "/distances.txt").c_str(), "wb");
   for (int64_t a : ans)

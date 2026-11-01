@@ -10,9 +10,10 @@ Every step from the reference to the current version. Each step lists the live-b
 | 3 | Memory diet: bins freed as the graph is built, compact search queues | 5223e25 | run-db3c3a2d92ae | 0.117 | 55.6 | 572 | 29.40 | 73.42 |
 | 4 | Bins freed between build passes instead of during them | 45e4d5b | run-157cf3e402b1 | 0.110 | 55.2 | 571 | 30.39 | 74.14 |
 | 5 | Chain contraction folded into the renumbering pass | 6bbd254 | run-caef9c2ebef7 | **0.110** | **55.2** | **563** | **30.44** | **74.17** |
-| 6 | Correctness fix in renumbering, profile-guided static build, parallel teardown, fused reverse pass | pending | pending | | | | | |
+| 6 | Correctness fix in renumbering, profile-guided static build, parallel teardown, fused reverse pass | 93ab427 | run-7e04fad34160 | 0.113 | 55.4 | 569 | 29.99 | 73.85 |
+| 7 | Step 6 without the parallel teardown; cheap racy claims again, with an exact fallback | pending | pending | | | | | |
 
-From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
+Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
 ---
 
@@ -60,6 +61,8 @@ Step 3 released memory while other threads were still busy building the graph. R
 Contraction used to be its own pass over the whole graph, followed by the renumbering pass. Now the chains are walked during renumbering, at the moment a node is expanded. This removes one full scan of the graph and its code. Time and memory stayed the same, and the program got 8 lines shorter.
 
 ### Step 6: a correctness fix, then a faster build
+*Board result: slower (0.113 s and 0.118 s). See step 7.*
+
 **The fix.** A stress test found a real bug. We ran every small test case many times, with different thread counts and under the address sanitizer. On one 32-node case the answers came out wrong in some runs. The renumbering claimed nodes with a plain read and write instead of an atomic operation, which is cheaper. When two threads raced on the same word, a node could be claimed twice and end up with two new ids. We knew about that race and believed it harmless. The trouble was the count: on a graph with nothing to contract, the duplicate ids push the node count past what the head field of an edge word can hold, so an id spills into the weight bits. The full-size graphs never get near that limit, because contraction removes 30% of the nodes first. But a correct program must not depend on that. Claims are now atomic, so every node gets exactly one id. To keep that cheap, a claim first reads the word normally and uses the atomic operation only when the node still looks free. A plain atomic on every attempt cost 4 to 10 ms; this version costs about 2 ms. After the fix, 1,968 runs over all 41 cases, with 2, 5 and 12 threads, normal and sanitized, all gave the right answer.
 
 **Profile-guided, fully static build.** The compiler now builds the program twice. The first build is instrumented and runs once on a small input made by the official generator, using seed 7 rather than the board's seed. The second build uses that profile to lay out the branchy loops (parsing, chain walks, the bucket drain) the way they actually run. The generator file is an unchanged copy of the published one, so it does not count as code. The binary is now linked fully static, so no dynamic loader runs before `main`. Locally, on the same machine and interleaved with the old version, this shaved about 2 ms off the minimum, with most of it in the renumbering pass.
@@ -69,6 +72,14 @@ Contraction used to be its own pass over the whole graph, followed by the renumb
 **One pass less for the reverse graph.** The pass that renames the forward edges now also counts how many edges arrive at each node, which is the first half of building the reverse graph. One full scan of the forward graph goes away. The reverse phase dropped from about 7 to about 5 ms, and the program got 8 lines shorter than it would otherwise be.
 
 Locally (25 interleaved runs, all outputs checked), the old version measured 112 / 118 / 125 ms (minimum / first quartile / median), and this version measured 108 / 113 / 116 ms. Memory and line count are unchanged within 1 MB and 6 lines.
+
+### Step 7: keep what helps, drop what the board did not like
+Step 6 was 3 to 8 ms slower on the board, while every local measurement said it was faster. Two of its parts depend heavily on the kernel and hardware, so they are the likely cause, and step 7 removes both:
+
+- **The parallel teardown.** When 12 threads free memory at the same moment, they compete for the kernel's page allocator lock, and each release interrupts every other core to flush its address cache. Our test machine runs a different kernel inside a virtual machine, so it could not show this.
+- **Atomic claims.** Atomic operations are slow on the board's CPU at its fixed 2.5 GHz. Renumbering uses cheap racy claims again. Two checks keep that safe. If the duplicate ids a race can create would ever overflow the head field, or a thread's edge buffer, the pass runs again with atomic claims. On full-size inputs this never triggers, so it costs nothing. On the tiny test graphs it does trigger, and the stress test (2,460 runs over all cases, normal and sanitized, with 2, 5 and 12 threads) passes. A stress run also showed that the old code could overrun a thread's edge buffer on a tiny graph, and the second check covers that.
+
+The profile-guided static build and the fused reverse pass stay. Locally, over 20 interleaved runs, step 7 measured 89 / 92 / 95 ms (minimum / first quartile / median), against 93 / 98 / 100 ms for step 5.
 
 ---
 
@@ -85,6 +96,7 @@ Each idea was measured against the version before it and dropped when it did not
 - **Releasing memory one page at a time.** Each release costs a little, and thousands of them added about 8 ms.
 - **Training the profile on a full-size input.** No better than the small sample, and it makes the build two minutes slower.
 - **An atomic operation on every claim attempt.** Correct, but 4 to 10 ms slower than reading first.
+- **A spinning barrier between phases** instead of the standard one, which sleeps. Much slower locally (median 127 ms against 101 ms), because a spinning thread takes execution slots from its busy hyperthread sibling.
 
 ---
 
