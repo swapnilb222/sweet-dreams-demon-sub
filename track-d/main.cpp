@@ -107,9 +107,9 @@ static inline u32 num(const char *&p) {
   return u32(w * 10000 + (w >> 32));
 }
 
-// One thread's edges, filed by tail part in page-sized chunks. Each quarter
-// of the parts has its own arena, unmapped once that quarter's CSR is written.
-static constexpr u32 CR = 682, G = 8; // records in a 4 KiB page, arenas
+// One thread's edges, filed by tail part in page-sized chunks. Each half of
+// the parts has its own arena, unmapped once that half's CSR is written.
+static constexpr u32 CR = 682, G = 2; // records in a 4 KiB page, arenas
 struct alignas(4096) Chunk {
   u32 x[CR];       // head | weight bits, as in the CSR
   uint16_t lo[CR]; // tail offset in its part
@@ -180,34 +180,35 @@ static Csr read_graph(const std::string &path, u32 &n,
   g.off = buf<u32>(n + 1), g.adj = buf<u32>(base[parts]);
   g.off[n] = base[parts];
   std::vector<Esc> esc(NT);
-  std::atomic<u32> next{0}, done[G]{};
-  u32 need[G]{};
-  for (u32 k = 0; k < parts; ++k)
-    ++need[k * G / parts];
-  par([&](unsigned t) {
-    std::vector<u32> cnt(PM + 1);
-    for (u32 k; (k = next++) < parts;) {
-      u32 lo = k << PB, len = std::min(n - lo, PM + 1), at = base[k];
-      std::fill(cnt.begin(), cnt.end(), 0);
-      for (auto &b : bins)
-        b.each(k, [&](u32, uint16_t i) { ++cnt[i]; });
-      for (u32 i = 0, u = lo; i < len; ++i, ++u) {
-        bool skip = cnt[i] <= 2 && !(term[u >> 6] >> (u & 63) & 1);
-        bypass[u >> 6] |= u64(skip) << (u & 63); // parts are word aligned
-        g.off[u] = at, at += cnt[i], cnt[i] = g.off[u];
-      }
-      for (auto &b : bins) {
-        auto h = b.heavy[k].begin();
-        b.each(k, [&](u32 x, uint16_t i) {
-          u32 s = cnt[i]++;
-          g.adj[s] = x >> HB == WM ? pack(x & HM, *h++, s, esc[t]) : x;
-        });
-      }
-      if (u32 a = k * G / parts; ++done[a] == need[a])
+  // One group of parts at a time; its bins are unmapped between groups, when
+  // no other thread is faulting pages in (munmap stalls them all).
+  for (u32 a = 0; a < G; ++a) {
+    std::atomic<u32> next{(a * parts + G - 1) / G};
+    u32 end = ((a + 1) * parts + G - 1) / G;
+    par([&](unsigned t) {
+      std::vector<u32> cnt(PM + 1);
+      for (u32 k; (k = next++) < end;) {
+        u32 lo = k << PB, len = std::min(n - lo, PM + 1), at = base[k];
+        std::fill(cnt.begin(), cnt.end(), 0);
         for (auto &b : bins)
-          munmap(b.arena[a], b.cap * sizeof(Chunk));
-    }
-  });
+          b.each(k, [&](u32, uint16_t i) { ++cnt[i]; });
+        for (u32 i = 0, u = lo; i < len; ++i, ++u) {
+          bool skip = cnt[i] <= 2 && !(term[u >> 6] >> (u & 63) & 1);
+          bypass[u >> 6] |= u64(skip) << (u & 63); // parts are word aligned
+          g.off[u] = at, at += cnt[i], cnt[i] = g.off[u];
+        }
+        for (auto &b : bins) {
+          auto h = b.heavy[k].begin();
+          b.each(k, [&](u32 x, uint16_t i) {
+            u32 s = cnt[i]++;
+            g.adj[s] = x >> HB == WM ? pack(x & HM, *h++, s, esc[t]) : x;
+          });
+        }
+      }
+    });
+    for (auto &b : bins)
+      munmap(b.arena[a], b.cap * sizeof(Chunk));
+  }
   merge(g.esc, esc);
   return g;
 }

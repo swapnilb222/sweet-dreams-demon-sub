@@ -6,10 +6,14 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
 | 1 | C++ port: parallel parse, CSR, bidirectional Dijkstra (commit 06837bc, 350 lines) | | 0.447 | 169 | 55.70 |
-| 2 | Chain contraction, BFS-blob renumbering, bucket-ring bidirectional search (commit bdfa5e8, 574 lines) | | 0.109 | 65 | ~73.5 (K 29.56) |
-| 3 | Memory diet: freed bin arenas, block-chained buckets, byte degrees (this version, 565 lines) | *pending board run* | | | |
+| 2 | Chain contraction, BFS-blob renumbering, bucket-ring bidirectional search (commit bdfa5e8, 574 lines) | run-6bc981e03f03 | 0.1088 | 65.3 | 73.54 |
+| 3 | Memory diet: freed bin arenas, block-chained buckets, byte degrees (commit 5223e25, 572 lines) | run-aa3192aa6e1c | 0.1246 | 54.8 | 72.83 |
+| 3 | same commit, second board sample (team SweetDreamsHalloween) | run-db3c3a2d92ae | 0.1174 | 55.6 | 73.42 |
+| 4 | Bin arenas unmapped between two fill passes instead of while other threads work (564 lines) | *pending board run* | | | |
 
-Fill in the Run ID column from the board; T and M for step 3 come from that run.
+Step 3 did what it set out to do on memory (65.3 to about 55 MB, as predicted locally). Board time rose 8 to 15%, though the two runs of the same commit differ from each other by 6%. Locally the two versions tied (step 3 below), so the cost is box-specific.
+
+The prime suspect is step 3's `munmap` of bin arenas while the other 11 threads are still filling the CSR. `munmap` takes the process's mmap lock for writing and sends TLB-shootdown IPIs to every core running the process, which stalls the other threads' page faults on the fresh CSR pages. Docker Desktop's VM hides most of this. Step 4 splits the fill into two passes over halves of the parts and unmaps each half's arenas between passes, when the workers are parked at the barrier. Local build peak: 47 to 49 MB, still below the BFS-phase peak (51 to 53), so M is unchanged. Local time is unchanged too (lap A/B, 10 interleaved runs: min total 103 for step 3, 98 for step 4, 102 for step 2).
 
 ## Step 3 in detail (local measurements, 2026-11-01)
 
@@ -19,8 +23,8 @@ Final A/B: 25 interleaved runs of step 2 vs step 3 on full seed 1.
 
 | | min T (ms) | median T (ms) | median peak (MiB) | max peak (MiB) | S (scc after clang-format) |
 |---|---:|---:|---:|---:|---:|
-| step 2 | 103.5 | 154.5 | 62.7 | 63.2 | 567 |
-| step 3 | 99.1 | 153.0 | 53.0 | 54.7 | 565 |
+| step 2 | 103.5 | 154.5 | 62.7 | 63.2 | 567 (board scc: 574) |
+| step 3 | 99.1 | 153.0 | 53.0 | 54.7 | 565 (board scc: 572) |
 
 The paired median time ratio is 0.979, so time is unchanged within noise. The peak falls by about 10 MB, which is worth about x1.035 on K from M alone.
 
