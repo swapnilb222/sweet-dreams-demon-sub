@@ -46,6 +46,14 @@ static void par(const std::function<void(unsigned)> &f) {
   gate->arrive_and_wait();
 }
 static u32 share(u32 n, unsigned t) { return u32(u64(n) * t / NT); }
+// Hands share t of k of [p, p + bytes) back to the kernel, so exit does not
+// have to tear the whole address space down on one thread.
+static void drop(const void *p, size_t bytes, unsigned t = 0, unsigned k = 1) {
+  uintptr_t a = (uintptr_t(p) + bytes * t / k + 4095) & ~uintptr_t(4095),
+            b = (uintptr_t(p) + bytes * (t + 1) / k) & ~uintptr_t(4095);
+  if (a < b)
+    madvise(reinterpret_cast<void *>(a), b - a, MADV_DONTNEED);
+}
 
 // Edge word: head in the low HB bits, weight above; an all-ones weight means
 // the real weight is in the slot's escape table.
@@ -165,6 +173,7 @@ static Csr read_graph(const std::string &path, u32 &n,
         b.heavy[k].push_back(w), w = WM;
       cur[k]->x[at[k]] = v | w << HB, cur[k]->lo[at[k]++] = uint16_t(u & PM);
     }
+    drop(text, size, t, NT); // its pages stay in the page cache
   });
   std::vector<u32> base(parts + 1, 0);
   for (u32 k = 0; k < parts; ++k) {
@@ -213,6 +222,48 @@ static Csr read_graph(const std::string &path, u32 &n,
   return g;
 }
 
+// Fills the transpose. Thread t owns the heads in [cut[t], cut[t + 1]); the
+// rename pass counted the edges into its slice from inside and passed the
+// others through inboxes, so no counter is shared.
+struct In {
+  u32 v, x, e; // head, tail | weight bits, forward slot
+};
+using Boxes = std::vector<std::vector<std::vector<In>>>;
+static void reverse(const Csr &f, Csr &r, const std::vector<u32> &cut,
+                    const Boxes &box) {
+  std::vector<u32> tot(NT + 1, 0);
+  par([&](unsigned t) {
+    for (auto &b : box)
+      for (In i : b[t])
+        ++r.off[i.v];
+    for (u32 v = cut[t]; v < cut[t + 1]; ++v)
+      tot[t + 1] += r.off[v];
+  });
+  for (unsigned t = 0; t < NT; ++t)
+    tot[t + 1] += tot[t];
+  std::vector<Esc> esc(NT);
+  par([&](unsigned t) {
+    u32 lo = cut[t], hi = cut[t + 1];
+    std::vector<u32> at(hi - lo);
+    for (u32 v = lo, s = tot[t]; v < hi; ++v)
+      at[v - lo] = s, s += r.off[v], r.off[v] = at[v - lo];
+    auto put = [&](u32 v, u32 x, u32 e) {
+      u32 s = at[v - lo]++;
+      r.adj[s] = x;
+      if (x >> HB == WM)
+        esc[t].push_back({s, weight(x, e, f.esc)});
+    };
+    for (u32 u = lo; u < hi; ++u)
+      for (u32 e = f.off[u]; e < f.off[u + 1]; ++e)
+        if (u32 x = f.adj[e], v = x & HM; v - lo < hi - lo)
+          put(v, u | (x & ~HM), e);
+    for (auto &b : box)
+      for (In i : b[t])
+        put(i.v, i.x, i.e);
+  });
+  merge(r.esc, esc);
+}
+
 // New ids: each thread grows compact BFS blobs over unclaimed nodes, seeding
 // the next blob from the last one's frontier, so consecutive ids are close.
 // Visiting a node also copies its edges, so the forward graph in the new
@@ -225,18 +276,17 @@ struct Region {
   Esc esc;
 };
 static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
-                   const std::vector<u64> &bypass) {
+                   const std::vector<u64> &bypass, Csr &rv) {
   auto skip = [&](u32 v) { return bypass[v >> 6] >> (v & 63) & 1; };
-  // Claims race without locked instructions, so a racing store can lose a bit.
-  // A node claimed twice leaves a copy that no edge reaches, since heads
-  // resolve through one id entry, so it is never on a shortest path.
+  // Claims are atomic, so every node gets exactly one new id and the count
+  // never grows past the head field.
   std::vector<std::atomic<u64>> taken((n >> 6) + 1);
   std::vector<Region> reg(NT);
   par([&](unsigned t) {
     auto claim = [&](u32 v) {
-      u64 w = taken[v >> 6];
-      taken[v >> 6].store(w | u64(1) << (v & 63), std::memory_order_relaxed);
-      return !(w >> (v & 63) & 1);
+      u64 bit = u64(1) << (v & 63);
+      return !(taken[v >> 6].load(std::memory_order_relaxed) & bit) &&
+             !(taken[v >> 6].fetch_or(bit, std::memory_order_relaxed) & bit);
     };
     Region &r = reg[t];
     r.ord.reserve(n / NT + n / NT / 4), r.deg.reserve(r.ord.capacity());
@@ -334,19 +384,29 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
   n = vs[NT];
   Csr f;
   f.off = buf<u32>(n + 1), f.adj = buf<u32>(es[NT]);
-  f.off[n] = es[NT];
+  rv.off = buf<u32>(n + 1), rv.adj = buf<u32>(es[NT]);
+  f.off[n] = rv.off[n] = es[NT];
   std::vector<Esc> esc(NT);
+  Boxes box(NT, std::vector<std::vector<In>>(NT));
   par([&](unsigned t) {
     Region &r = reg[t];
     auto w = r.wide.begin();
-    for (u32 i = 0, at = es[t]; i < vs[t + 1] - vs[t]; ++i)
-      f.off[vs[t] + i] = at, at += r.deg[i] == 255 ? *w++ : r.deg[i];
-    r.deg = {};
-    u32 m = es[t + 1] - es[t], *a = &f.adj[es[t]];
-    for (u32 j = 0; j < m; ++j) {
-      if (j + 32 < m)
-        __builtin_prefetch(&id[r.out[j + 32] & HM]);
-      a[j] = id[r.out[j] & HM] | (r.out[j] & ~HM);
+    u32 lo = vs[t], hi = vs[t + 1], m = es[t + 1] - es[t], *a = &f.adj[es[t]];
+    std::fill(&rv.off[lo], &rv.off[hi], 0);
+    // Renames heads and counts the reverse degrees of this thread's slice.
+    for (u32 u = lo, j = 0; u < hi; ++u) {
+      f.off[u] = es[t] + j;
+      for (u32 k = r.deg[u - lo] == 255 ? *w++ : r.deg[u - lo]; k--; ++j) {
+        if (j + 32 < m)
+          __builtin_prefetch(&id[r.out[j + 32] & HM]);
+        u32 x = id[r.out[j] & HM] | (r.out[j] & ~HM), v = x & HM;
+        a[j] = x;
+        if (v - lo < hi - lo)
+          ++rv.off[v];
+        else
+          box[t][std::upper_bound(vs.begin(), vs.end(), v) - vs.begin() - 1]
+              .push_back({v, u | (x & ~HM), es[t] + j});
+      }
     }
     for (auto [j, w] : r.esc)
       esc[t].push_back({es[t] + j, w});
@@ -355,65 +415,9 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
   merge(f.esc, esc);
   for (auto &[s, t] : qs)
     s = id[s], t = id[t];
+  id.reset();
+  reverse(f, rv, vs, box);
   return f;
-}
-
-// Transpose. Each thread owns a slice of heads; edges into other slices are
-// handed over through inboxes, so no counter is shared.
-static Csr reverse(const Csr &f, u32 n) {
-  struct In {
-    u32 v, x, e; // head, tail | weight bits, forward slot
-  };
-  std::vector<std::vector<std::vector<In>>> box(
-      NT, std::vector<std::vector<In>>(NT));
-  std::vector<u32> cut(NT + 1), tot(NT + 1, 0);
-  for (unsigned t = 0; t <= NT; ++t)
-    cut[t] = share(n, t);
-  Csr r;
-  r.off = buf<u32>(n + 1), r.adj = buf<u32>(f.off[n]);
-  r.off[n] = f.off[n];
-  par([&](unsigned t) {
-    u32 lo = cut[t], hi = cut[t + 1];
-    std::fill(&r.off[lo], &r.off[hi], 0);
-    for (u32 u = lo; u < hi; ++u)
-      for (u32 e = f.off[u]; e < f.off[u + 1]; ++e)
-        if (u32 x = f.adj[e], v = x & HM; v - lo < hi - lo)
-          ++r.off[v];
-        else
-          box[t][std::upper_bound(cut.begin(), cut.end(), v) - cut.begin() - 1]
-              .push_back({v, u | (x & ~HM), e});
-  });
-  par([&](unsigned t) {
-    for (auto &b : box)
-      for (In i : b[t])
-        ++r.off[i.v];
-    for (u32 v = cut[t]; v < cut[t + 1]; ++v)
-      tot[t + 1] += r.off[v];
-  });
-  for (unsigned t = 0; t < NT; ++t)
-    tot[t + 1] += tot[t];
-  std::vector<Esc> esc(NT);
-  par([&](unsigned t) {
-    u32 lo = cut[t], hi = cut[t + 1];
-    std::vector<u32> at(hi - lo);
-    for (u32 v = lo, s = tot[t]; v < hi; ++v)
-      at[v - lo] = s, s += r.off[v], r.off[v] = at[v - lo];
-    auto put = [&](u32 v, u32 x, u32 e) {
-      u32 s = at[v - lo]++;
-      r.adj[s] = x;
-      if (x >> HB == WM)
-        esc[t].push_back({s, weight(x, e, f.esc)});
-    };
-    for (u32 u = lo; u < hi; ++u)
-      for (u32 e = f.off[u]; e < f.off[u + 1]; ++e)
-        if (u32 x = f.adj[e], v = x & HM; v - lo < hi - lo)
-          put(v, u | (x & ~HM), e);
-    for (auto &b : box)
-      for (In i : b[t])
-        put(i.v, i.x, i.e);
-  });
-  merge(r.esc, esc);
-  return r;
 }
 
 // One search direction: a ring of distance buckets (far jumps wait in a heap)
@@ -584,19 +588,25 @@ int main(int argc, char **argv) {
   }
   u32 n;
   std::vector<u64> bypass;
-  Csr fwd = read_graph(data + "/graph.txt", n, qs, bypass);
-  fwd = reorder(std::move(fwd), n, qs, bypass);
-  Csr rev = reverse(fwd, n);
+  Csr rev, fwd = read_graph(data + "/graph.txt", n, qs, bypass);
+  fwd = reorder(std::move(fwd), n, qs, bypass, rev);
   std::vector<u32> order(qs.size());
   std::iota(order.begin(), order.end(), 0);
   std::sort(order.begin(), order.end(),
             [&](u32 a, u32 b) { return qs[a] < qs[b]; });
   std::vector<int64_t> ans(qs.size());
   std::atomic<size_t> next{0};
-  par([&](unsigned) {
-    Solver solver(fwd, rev, n);
+  u32 m = fwd.off[n];
+  par([&](unsigned t) {
+    // Never freed: unmapping while other threads search would stall them.
+    Solver &solver = *new Solver(fwd, rev, n);
     for (size_t k; (k = next++) < qs.size();)
       ans[order[k]] = solver.solve(qs[order[k]].first, qs[order[k]].second);
+    gate->arrive_and_wait(); // every search is done
+    for (Side *s : {&solver.f, &solver.b})
+      drop(s->pool.get(), s->dir.size() * s->PG * 8);
+    for (const Csr *g : {&fwd, &rev})
+      drop(g->off.get(), (n + 1) * 4, t, NT), drop(g->adj.get(), m * 4, t, NT);
   });
   FILE *file = fopen((out + "/distances.txt").c_str(), "wb");
   for (int64_t a : ans)
