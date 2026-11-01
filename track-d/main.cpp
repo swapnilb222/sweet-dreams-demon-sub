@@ -1,10 +1,10 @@
 // Track D: exact shortest paths for 2,000 local queries on a 5M-edge road graph.
 // 1. Parse (SWAR, 12 threads) into bins keyed by the tail's part of the id
 //    range, then build each part's CSR in cache.
-// 2. Contract chains: edges into nodes of out-degree <= 2 that no query names
-//    are redirected past them, which drops about 30% of the nodes.
-// 3. Renumber the rest by BFS blobs, so graph neighbours are memory neighbours,
-//    and build forward and reverse CSR in that numbering.
+// 2. Renumber by BFS blobs, so graph neighbours are memory neighbours. While
+//    expanding a node, each edge into a node of out-degree <= 2 that no query
+//    names is walked along its chain to the first node that must stay, which
+//    drops about 30% of the nodes. Then build forward and reverse CSR.
 // 4. Bidirectional Dijkstra per query on a bucket queue, with distances kept
 //    in pages handed out on first touch.
 #include <algorithm>
@@ -33,7 +33,7 @@ using Esc = std::vector<std::pair<u32, u64>>; // slot -> weight too big to pack
 template <class T> using Buf = std::unique_ptr<T[]>;
 template <class T> static Buf<T> buf(size_t n) { return Buf<T>(new T[n]); }
 static constexpr u64 INF = u64(1) << 62;
-static constexpr u32 BLOB = 512;
+static constexpr u32 BLOB = 512, BATCH = 8;
 
 // Persistent workers: thread start-up per phase would cost milliseconds.
 static unsigned NT;
@@ -213,57 +213,6 @@ static Csr read_graph(const std::string &path, u32 &n,
   return g;
 }
 
-// Redirects every edge of a kept node that enters a bypassable node (out-degree
-// <= 2, no query endpoint) along the chain to the first node that must stay;
-// a useless walk becomes a self-loop. Walks advance in lockstep, 32 at a time,
-// so their cache misses overlap.
-static void contract(Csr &g, u32 n, const std::vector<u64> &bypass) {
-  auto skip = [&](u32 v) { return bypass[v >> 6] >> (v & 63) & 1; };
-  struct Walk {
-    u32 e, root, prev, at, steps;
-    u64 w;
-  };
-  std::vector<Esc> esc(NT);
-  par([&](unsigned t) {
-    std::vector<Walk> live;
-    auto run = [&] {
-      while (!live.empty()) {
-        size_t kept = 0;
-        for (Walk k : live) {
-          u32 ahead = 0, next = 0, end = ~0u;
-          u64 nw = 0;
-          for (u32 e = g.off[k.at]; e < g.off[k.at + 1]; ++e)
-            if (u32 h = g.adj[e] & HM; h != k.prev && h != k.at)
-              ++ahead, next = h, nw = weight(g.adj[e], e, g.esc);
-          if (ahead > 1)
-            end = k.at;
-          else if (ahead == 0 || next == k.root)
-            end = k.root, k.w = 0;
-          else if (k.w += nw, k.prev = k.at, k.at = next;
-                   !skip(next) || ++k.steps == 64)
-            end = next;
-          if (end != ~0u)
-            g.adj[k.e] = pack(end, k.w, k.e, esc[t]);
-          else
-            __builtin_prefetch(&g.off[next]), live[kept++] = k;
-        }
-        live.resize(kept);
-      }
-    };
-    for (u32 u = share(n, t); u < share(n, t + 1); ++u) {
-      for (u32 e = g.off[u]; !skip(u) && e < g.off[u + 1]; ++e)
-        if (u32 y = g.adj[e] & HM; skip(y))
-          live.push_back({e, u, u, y, 0, weight(g.adj[e], e, g.esc)}),
-              __builtin_prefetch(&g.off[y]);
-      if (live.size() >= 32)
-        run();
-    }
-    run();
-  });
-  esc.push_back(std::move(g.esc)); // last, so rewritten slots find fresh ones
-  g.esc = {}, merge(g.esc, esc);
-}
-
 // New ids: each thread grows compact BFS blobs over unclaimed nodes, seeding
 // the next blob from the last one's frontier, so consecutive ids are close.
 // Visiting a node also copies its edges, so the forward graph in the new
@@ -293,6 +242,11 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
     r.ord.reserve(n / NT + n / NT / 4), r.deg.reserve(r.ord.capacity());
     r.out = buf<u32>(g.off[n]);
     std::vector<u32> seeds;
+    struct Walk {
+      u32 slot, root, prev, at, steps;
+      u64 w;
+    };
+    std::vector<Walk> walks;
     u32 &j = r.m;
     for (u32 scan = share(n, t);;) {
       u32 seed = ~0u;
@@ -305,27 +259,64 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
       if (seed == ~0u)
         return;
       size_t blob = r.ord.size();
+      auto visit = [&](u32 v) {
+        if (r.ord.size() - blob < BLOB) {
+          if (claim(v))
+            r.ord.push_back(v), __builtin_prefetch(&g.off[v]);
+        } else if (!(taken[v >> 6] >> (v & 63) & 1))
+          seeds.push_back(v);
+      };
+      auto put = [&](u32 slot, u32 v, u64 w) {
+        if (w >= WM)
+          r.esc.push_back({slot, w});
+        r.out[slot] = v | u32(std::min<u64>(w, WM)) << HB;
+      };
       r.ord.push_back(seed);
-      for (size_t i = blob; i < r.ord.size(); ++i) {
-        if (i + 4 < r.ord.size())
-          __builtin_prefetch(&g.adj[g.off[r.ord[i + 4]]]);
-        u32 from = j;
-        for (u32 u = r.ord[i], e = g.off[u]; e < g.off[u + 1]; ++e) {
-          u32 x = g.adj[e], v = x & HM;
-          if (v == u)
-            continue;
-          if (x >> HB == WM)
-            r.esc.push_back({j, weight(x, e, g.esc)});
-          r.out[j++] = x;
-          if (r.ord.size() - blob < BLOB) {
-            if (claim(v))
-              r.ord.push_back(v), __builtin_prefetch(&g.off[v]);
-          } else if (!(taken[v >> 6] >> (v & 63) & 1))
-            seeds.push_back(v);
+      for (size_t lo = blob, hi; lo < r.ord.size(); lo = hi) {
+        hi = std::min(r.ord.size(), lo + BATCH);
+        for (size_t i = lo; i < hi; ++i) {
+          if (i + BATCH < r.ord.size())
+            __builtin_prefetch(&g.adj[g.off[r.ord[i + BATCH]]]);
+          u32 from = j;
+          for (u32 u = r.ord[i], e = g.off[u]; e < g.off[u + 1]; ++e) {
+            u32 x = g.adj[e], v = x & HM;
+            if (v == u)
+              continue;
+            if (skip(v)) // walked below; its slot is filled when it ends
+              walks.push_back({j++, u, u, v, 0, weight(x, e, g.esc)}),
+                  __builtin_prefetch(&g.off[v]);
+            else
+              put(j++, v, weight(x, e, g.esc)), visit(v);
+          }
+          r.deg.push_back(uint8_t(std::min(j - from, 255u)));
+          if (j - from >= 255)
+            r.wide.push_back(j - from);
         }
-        r.deg.push_back(uint8_t(std::min(j - from, 255u)));
-        if (j - from >= 255)
-          r.wide.push_back(j - from);
+        // Chain walks of this batch advance one hop per round, so their
+        // misses overlap. A branch ends a walk at a node that stays; a dead
+        // end or a way back to the root leaves a useless self-loop.
+        while (!walks.empty()) {
+          size_t kept = 0;
+          for (Walk k : walks) {
+            u32 ahead = 0, next = 0, end = ~0u;
+            u64 nw = 0;
+            for (u32 e = g.off[k.at]; e < g.off[k.at + 1]; ++e)
+              if (u32 h = g.adj[e] & HM; h != k.prev && h != k.at)
+                ++ahead, next = h, nw = weight(g.adj[e], e, g.esc);
+            if (ahead > 1)
+              end = k.at;
+            else if (ahead == 0 || next == k.root)
+              end = k.root, k.w = 0;
+            else if (k.w += nw, k.prev = k.at, k.at = next;
+                     !skip(next) || ++k.steps == 64)
+              end = next;
+            if (end == ~0u)
+              __builtin_prefetch(&g.off[next]), walks[kept++] = k;
+            else if (put(k.slot, end, k.w); end != k.root)
+              visit(end);
+          }
+          walks.resize(kept);
+        }
       }
     }
   });
@@ -594,7 +585,6 @@ int main(int argc, char **argv) {
   u32 n;
   std::vector<u64> bypass;
   Csr fwd = read_graph(data + "/graph.txt", n, qs, bypass);
-  contract(fwd, n, bypass);
   fwd = reorder(std::move(fwd), n, qs, bypass);
   Csr rev = reverse(fwd, n);
   std::vector<u32> order(qs.size());
