@@ -1,4 +1,4 @@
-// Speed Demon 2026, Track A (Ingest).
+// Speed Demon 2026, Track A (Ingest)
 //
 // One parallel region, three phases separated by barriers:
 // 1. Threads claim 1 MiB chunks of the mmap'd log, parse every line once and
