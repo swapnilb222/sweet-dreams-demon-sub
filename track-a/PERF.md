@@ -116,6 +116,44 @@ Rejected in step 5:
 
 Verification for step 5: 17 datasets byte-identical, 3 runs each; ThreadSanitizer and ASan/UBSan clean on 13 small and medium inputs; `check.py` passes with the real Dockerfile. Candidates kept in `dev/` (`branchless_`, `vpick16_`, `shared_dict_`, `lomuto_`, `slots16384_`, `cursor_candidate.cpp`).
 
+## Board results for step 5, and step 6 (2026-11-01)
+
+| Board row (as reported; run IDs not recorded) | T | M | Lines | K |
+|---|---:|---:|---:|---:|
+| Step 4 + THP disable only | 0.026 s | 26 MB | 358 | 41.05 |
+| **Step 5** (branch-free parse/select, shared table) | **0.020 s** | **24 MB** | 416 | **46.15** (rank 11) |
+
+The THP hypothesis was right: 38 to 26 MB from one `prctl` line. Step 5's 26 to 20 ms came from 17% fewer instructions and 78% fewer mispredicts; the cost model predicted ~18 ms.
+
+**What the two board points imply.** Fitting T = a + b · cycles to steps 4 and 5 gives a fixed, non-scaling part of roughly 5-9 ms, depending on the assumed IPC and mispredict penalty. Locally, `perf stat` puts 30-40% of CPU in the kernel: 11.3k page faults, mmap-lock contention, TLB-flush IPIs and page clearing. This share is the largest remaining unknown, and the VM (Hyper-V paravirtual locks) cannot reproduce the board's kernel behaviour, so only board runs can settle it.
+
+Step 6 changes (instructions and mispredicts by cachegrind on full seed 1, one thread):
+
+| Change | Ir (M) | Mispredicts (M) | Kept? |
+|---|---:|---:|---|
+| Step 5 baseline | 627.6 | 1.66 | |
+| Rare paths marked `[[unlikely]]` (insert, hour change, large latency, block refill) | 617.0 | 1.73 | yes |
+| Rare paths moved out of line (`probe`, `refill`, `keep_big`): the parse loop no longer contains calls, so GCC stops rematerialising its AVX constants every iteration | 598.0 | 1.66 | yes; phase 1 364 to 333M (107 Ir/line) |
+| 512-record blocks (was 1024) | 598.7 | 1.67 | yes, -0.2 MiB |
+| Scratch carved from each pool mapping, stats a static zero-page array: no `mmap` (address-space lock) inside the merge barrier | 599.6 | 1.70 | yes, -9 lines |
+| R5 sample-then-filter selection for large groups (64-value sample, ±4 brackets) | 641.1 | 1.92 | no: 29% of brackets missed (±4 of 64 is ~1σ at the median) and the scalar count/copy loops did not vectorise |
+| R2 two interleaved cursors per chunk | 684.0 | 1.69 | no: -3.7% laptop wall but +9% Ir; laptop E-cores run alone, while board threads share cores with a hyperthread, so the gain is not expected to carry over |
+| Right-to-left branch-free number formatting | 667.2 | 1.50 | no: +40M Ir for -0.17M mispredicts |
+| Fixed-shape small selection (8/16 steps, masked) | 654.2 | 1.35 | no: +27M Ir |
+| `std::to_chars` instead of the pair-table `put` (-15 lines) | 604.3 | 1.81 | no: about +1% cycles for about +0.5% S |
+| R1 `pread` into 256 KiB / 512 KiB buffers | | | not locally: faults 11.1k to 8.1k, but system time not lower and wall time slower. Kept as a board experiment. |
+
+Measured split for step 6: phase 1 333M Ir, 0.45M mispredicts; phases 2-3 267M Ir, 1.25M mispredicts. Selection takes ~137M: groups over 256 values 61M (36 per value), groups of 16 or fewer 36M plus 0.44M mispredicts. Aggregation's two record passes take ~59M and formatting ~44M. Local peak memory 23.4 MiB (step 5 board version: 23.7 measured the same way). Lines 426.
+
+Research mapping (RESEARCH_IDEAS_track1.md): R4 shared table done in step 5; R1, R2, R5 measured above; R6 superseded by the vectorised rank counter; R7 formatting is about 7% of Ir; R9's spin barrier was measured slower earlier (+13%).
+
+Board experiments prepared and validated (17/17), because they hinge on kernel behaviour the VM cannot show:
+
+- `dev/board_exp_nomadvise_candidate.cpp`: no per-chunk `MADV_DONTNEED`, so no TLB-shootdown IPIs, with teardown left to exit.
+- `dev/board_exp_pread_candidate.cpp`: R1, no input mapping at all.
+
+Verification for step 6: 17 datasets byte-identical, 3 runs each; ThreadSanitizer and ASan/UBSan clean on 13 small and medium inputs; `check.py` passes.
+
 ## Protocol and evidence
 
 - Full seed-1 input: 3,100,000 records, 238,836,234 bytes.

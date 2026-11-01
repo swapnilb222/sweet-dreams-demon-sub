@@ -36,7 +36,7 @@ constexpr size_t CHUNK = 1 << 20, PAGE = 4096;
 constexpr uint32_t BIG = (1u << 20) - 1;
 // Buckets grow in 4 KiB blocks from one pool per thread, so page tables stay
 // compact and each bucket wastes at most one partly filled block.
-constexpr size_t BLOCK = 1024;
+constexpr size_t BLOCK = 512;
 
 const char *data;
 size_t size;
@@ -232,17 +232,27 @@ struct Dictionary {
       tail = load8(s + len - 8);
     uint32_t hash = _mm_crc32_u64(_mm_crc32_u64(len, head), tail);
     uint64_t want = uint64_t(hash) << 32 | len << 16;
+    uint64_t key = slots[hash % SLOTS].load(std::memory_order_acquire);
+    if ((key & ~0xFFFFull) == want && same(s, names[key & 0xFFFF], len))
+      [[likely]] return key & 0xFFFF;
+    return probe(s, len, hash, want);
+  }
+
+  // Everything but a first-slot hit, kept out of line so the parse loop stays
+  // small and keeps its vector constants in registers.
+  [[gnu::noinline]] uint32_t probe(const char *s, uint32_t len, uint32_t hash,
+                                   uint64_t want) {
     for (uint32_t i = hash;; ++i) {
       std::atomic<uint64_t> &slot = slots[i % SLOTS];
       uint64_t key = slot.load(std::memory_order_acquire);
-      if (!key && slot.compare_exchange_strong(key, BUSY)) {
+      if (!key && slot.compare_exchange_strong(key, BUSY)) [[unlikely]] {
         unsigned id = size++;
         std::memcpy(names[id], s, len);
         lens[id] = uint8_t(len);
         slot.store(want | id, std::memory_order_release);
         return id;
       }
-      if (key <= BUSY) { // being inserted (or just claimed): look again
+      if (key <= BUSY) [[unlikely]] { // being inserted or claimed: look again
         --i;
         continue;
       }
@@ -262,6 +272,14 @@ struct Worker {
   uint32_t count[MAX_EP], errors[MAX_EP], offset[MAX_EP];
   uint32_t *scratch;
 
+  [[gnu::noinline]] void keep_big(unsigned h, uint64_t r) {
+    big[h].push_back(r);
+  }
+  [[gnu::noinline]] uint32_t *refill(unsigned h, uint32_t *&c) {
+    blocks[h].push_back(c = pool);
+    return pool += BLOCK;
+  }
+
   template <class F> void each_record(int h, F f) {
     for (uint32_t *b : blocks[h])
       for (uint32_t *r = b, *e = b == blocks[h].back() ? cur[h] : b + BLOCK;
@@ -276,7 +294,7 @@ struct Worker {
     unsigned h = 0;
     uint32_t *c = cur[0], *lim = limit[0]; // the current hour's bucket cursor
     while (p < end) {
-      if (load8(p + 5) != key) { // bytes 5..12, "MM-DDTHH", identify the hour
+      if (load8(p + 5) != key) [[unlikely]] { // bytes 5..12, "MM-DDTHH": hour
         cur[h] = c, limit[h] = lim;
         key = load8(p + 5), h = hour_of(p);
         c = cur[h], lim = limit[h];
@@ -288,14 +306,12 @@ struct Worker {
       const char *e = m ? p + 31 + __builtin_ctzll(m) : find(p + 95, ' ');
       uint32_t id = dict.lookup(s, uint32_t(e - s)) | (e[1] == '5') << 11;
       uint32_t v = parse_latency(e + 5, p);
-      if (v >= BIG) {
-        big[h].push_back(uint64_t(v) << 12 | id);
+      if (v >= BIG) [[unlikely]] {
+        keep_big(h, uint64_t(v) << 12 | id);
         continue;
       }
-      if (c == lim) {
-        blocks[h].push_back(c = pool);
-        lim = pool += BLOCK;
-      }
+      if (c == lim) [[unlikely]]
+        lim = refill(h, c);
       *c++ = v << 12 | id;
     }
     cur[h] = c, limit[h] = lim;
@@ -310,7 +326,7 @@ int by_size[HOURS];               // hours, largest first
 struct Stat {
   uint32_t n, errors, p[3];
 };
-Stat *stats;                       // [hour][output order]
+Stat stats[HOURS * MAX_EP];        // [hour][output order]; zero pages
 size_t hour_bytes[HOURS + 1];      // becomes each hour's file offset
 char *out;
 
@@ -324,8 +340,7 @@ void merge() {
   });
   for (unsigned k = 0; k < neps; ++k)
     rank_of[sorted_ids[k]] = uint16_t(k);
-  // Hour sizes, rounded up to whole blocks, schedule phase 2 and bound its
-  // scratch buffers.
+  // Hour sizes, rounded up to whole blocks, schedule phase 2.
   size_t lines[HOURS] = {};
   for (int h = 0; h < HOURS; ++h) {
     by_size[h] = h;
@@ -334,10 +349,6 @@ void merge() {
   }
   std::sort(by_size, by_size + HOURS,
             [&](int a, int b) { return lines[a] > lines[b]; });
-  for (unsigned t = 0; t < threads; ++t)
-    workers[t].scratch =
-        static_cast<uint32_t *>(std::malloc(lines[by_size[0]] * 4 + 32));
-  stats = static_cast<Stat *>(std::calloc(size_t(HOURS) * neps, sizeof(Stat)));
 }
 
 void aggregate(Worker &me, int h) {
@@ -367,7 +378,7 @@ void aggregate(Worker &me, int h) {
     uint32_t *vg = v + off[g] - n; // off[g] now marks the end of group g
     uint32_t rank[3] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1,
                         (99 * n + 99) / 100 - 1};
-    Stat &s = stats[size_t(h) * neps + g];
+    Stat &s = stats[h * MAX_EP + g];
     s = {n, err[g], {}};
     select(vg, 0, n, rank, 3, s.p);
     bytes += 28 + dict.lens[sorted_ids[g]] + digits(n) +
@@ -385,7 +396,7 @@ void format(int h) {
                 day < 2 ? "10" : "11", day < 2 ? 30 + day : day - 1, clock % 24);
   char *o = out + hour_bytes[h];
   for (unsigned g = 0; g < neps; ++g) {
-    const Stat &s = stats[size_t(h) * neps + g];
+    const Stat &s = stats[h * MAX_EP + g];
     if (!s.n)
       continue;
     std::string_view name = dict.name(sorted_ids[g]);
@@ -436,8 +447,9 @@ int main(int argc, char **argv) {
                        unsigned(MAX_THREADS));
   threads = unsigned(std::min<size_t>(threads, (size + CHUNK - 1) / CHUNK));
   // A thread can at most parse every line of the file (40 bytes minimum each).
-  // Reserve that much address space; only touched pages are charged.
-  size_t cap = (size / 40 + (HOURS + 1) * BLOCK) * 4;
+  // Reserve that much address space for its records, and as much again for
+  // its phase-2 scratch; only touched pages are charged.
+  size_t lines = size / 40 + 8, cap = (2 * lines + (HOURS + 1) * BLOCK) * 4;
   for (unsigned t = 0; t < threads; ++t) {
     void *p = mmap(nullptr, cap, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -445,6 +457,7 @@ int main(int argc, char **argv) {
       return 1;
     madvise(p, cap, MADV_NOHUGEPAGE); // a huge page per block would be charged
     workers[t].pool = static_cast<uint32_t *>(workers[t].base = p);
+    workers[t].scratch = workers[t].pool + lines + (HOURS + 1) * BLOCK;
   }
 
   bool failed = false;
