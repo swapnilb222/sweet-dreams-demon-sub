@@ -196,6 +196,41 @@ Local wall time: level with step 7 when `/out` is tmpfs (17.9 vs 17.2 ms), slowe
 
 Verification for step 8: 17 datasets byte-identical, 3 runs; ThreadSanitizer and ASan/UBSan clean on 11 inputs including the rerun path; `check.py` passes with the real Dockerfile.
 
+## Step 8 on the board, and what limits K (2026-11-01)
+
+**Board run `run-e516788ab07b`** (commit `aee80127`): **T 17.663 ms, M 22.09 MB, S 582, K 47.82** (step 7 `run-d74d8f6c4bd8`: 19.544 ms / 23.38 MB / 426 / 47.10). A later run of what appears to be the same 582-line code under the team's second entry, `run-cfb8cb859ca2`, scored 20.82 ms / 21.25 MB. If the code is identical, single board runs vary by up to about 18%.
+
+**Output memory cannot be dropped on the board.** With `/out` on tmpfs, local peaks match the board to within 1 MB for both designs: step 8 21.0 MiB locally vs 21.3-22.1 on the board, step 7 23.5 vs 23.4. The ext4 runs that dropped output pages (14-19 MiB) do not. So the board charges the whole 10 MB output to every entry, and ref2's `sync_file_range` + `POSIX_FADV_DONTNEED` buy nothing there. The leaders' 15.6-17.3 MB therefore means a working set of about 3-5 MB beyond output and floor; ours is about 8.5 MB.
+
+Gap to #1 as factors of K, from the board rows:
+
+| Axis | Ours | #1 | Factor |
+|---|---:|---:|---:|
+| T | 17.66 ms | 16.09 ms | 1.048 |
+| M | 22.09 MB | 17.26 MB | 1.050 |
+| S | 582 | 346 | **1.081** |
+
+Step 8 working-set breakdown (pool counters): run buffers 104-138 x 39 KB (about 2-5 MB touched), latency buffers 6-7 x about 300 KB, and output parts waiting for the in-order writer 9-28 x about 150 KB.
+
+Experiments (memory with `/out` on tmpfs, which matches the board; wall time with `/out` on tmpfs):
+
+| Change | Peak (MiB) | Wall | Ir (M) | Kept? |
+|---|---:|---:|---:|---|
+| Step 8 | 21.7 | 17.9 ms | 528.5 | |
+| A: no `sync_file_range` / `fadvise` | 22.6 | 20.3 ms (noise) | 528.5 | folded into trim1 |
+| A + 128 KB blocks | 22.1 | 24.7 ms | 530.5 | no |
+| A + parse-ahead window of `threads` blocks | 20.9 | 30.1 ms | 528.5 | no |
+| A + both | 18.8 | 81 ms | 530.5 | no: the narrower window starves the pipeline |
+| + 64 KB blocks / window `threads / 2` | 18.2 / 17.2 | about 148 ms | 534.2 | no |
+| Step 7's selection in place of ref2's (-51 lines) | | | 597.3 (1.25M mispredicts) | no: ref2's compress-partition and bitonic network are much cheaper |
+| trim1: one shared CAS dictionary with a mutex-kept sorted id list instead of per-thread mirrors + spinlock; dead destructor and writeback calls removed (-37 lines) | | | 543.7 | candidate: +3% Ir for -6% lines, about neutral on K |
+
+## Language and PGO (2026-11-01)
+
+**Rust was considered and not adopted.** It compiles through LLVM to the same machine code: the same AVX2 intrinsics, `mmap`, atomics and threads. Code is counted after `rustfmt`, which is no shorter than clang-format, and `unsafe`, casts and `libc` calls usually lengthen a port. Its one allowlist perk, an image with llvm-tools for PGO, has a GCC equivalent.
+
+**GCC profile-guided build** (`dev/pgo/Dockerfile` plus a byte-identical copy of the published generator, free on S). It trains offline on a generated full log with seed 7 (not the board's seed), then rebuilds with `-fprofile-use -fprofile-partial-training`. The image builds offline in 34 s and gives the full seed 1 hash; all 17 datasets match. Cachegrind shows no gain (step 8: 528.5 to 535.2M Ir; step 7 unchanged), since PGO mainly changes code layout. On a heavily loaded laptop, total CPU was 353 vs 393 ms (rounds varying by ±60 ms) with wall time level. Inconclusive locally, so it is a one-push board experiment: copy `dev/pgo/Dockerfile` and `dev/pgo/a_ingest.py` into `track-a/`. That adds 1 line on S.
+
 ## Protocol and evidence
 
 - Full seed-1 input: 3,100,000 records, 238,836,234 bytes.
