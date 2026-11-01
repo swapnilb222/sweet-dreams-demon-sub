@@ -11,7 +11,8 @@ Every step from the reference to the current version. Each step lists the live-b
 | 4 | Bins freed between build passes instead of during them | 45e4d5b | run-157cf3e402b1 | 0.110 | 55.2 | 571 | 30.39 | 74.14 |
 | 5 | Chain contraction folded into the renumbering pass | 6bbd254 | run-caef9c2ebef7 | **0.110** | **55.2** | **563** | **30.44** | **74.17** |
 | 6 | Correctness fix in renumbering, profile-guided static build, parallel teardown, fused reverse pass | 93ab427 | run-7e04fad34160 | 0.113 | 55.4 | 569 | 29.99 | 73.85 |
-| 7 | Step 6 without the parallel teardown; cheap racy claims again, with an exact fallback | pending | pending | | | | | |
+| 7 | Step 6 without the parallel teardown; cheap racy claims again, with an exact fallback | 93a6c1c | run-b0e091cfc395 | 0.109 | 55.3 | 571 | 30.63 | 74.30 |
+| 8 | Prefetched chain walks, branch-free relaxation | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -81,6 +82,16 @@ Step 6 was 3 to 8 ms slower on the board, while every local measurement said it 
 
 The profile-guided static build and the fused reverse pass stay. Locally, over 20 interleaved runs, step 7 measured 89 / 92 / 95 ms (minimum / first quartile / median), against 93 / 98 / 100 ms for step 5.
 
+*Board result: 0.109 s and 0.113 s, level with step 5. The board's noise turned out to be larger than we thought: another team's identical runs went from 0.098 s to 0.114 s.*
+
+### Step 8: two fixes in the hot loops
+We compared each phase against another implementation of the same design. Two of our loops were slower, and each had a clear cause.
+
+- **Chain walks waited on memory twice per hop.** Each round of walks fetched a node's row offset ahead of time, but not the row itself, so reading the edges still missed the cache. Now, at the start of each round, the walks first request the rows of the nodes they are about to read, and all of those misses overlap. The renumbering phase dropped from about 32 to 29 ms.
+- **The search branched on a coin flip.** For every edge, the search asked "is this a shorter path?", and the answer is close to random, so the CPU guessed wrong about half the time. Now it always writes the new label as the minimum of the old and new values, and always writes the queue entry, counting it only when the path really was shorter. Nothing in the loop depends on the comparison any more. The query phase dropped from about 26.5 to 25 ms.
+
+Locally, over 20 interleaved runs with the board's build, step 8 measured 85 / 87 / 93 ms (minimum / first quartile / median), against 94 / 97 / 101 ms for step 7. It is 2 lines longer.
+
 ---
 
 ## Things we tried that did not help
@@ -96,6 +107,7 @@ Each idea was measured against the version before it and dropped when it did not
 - **Releasing memory one page at a time.** Each release costs a little, and thousands of them added about 8 ms.
 - **Training the profile on a full-size input.** No better than the small sample, and it makes the build two minutes slower.
 - **An atomic operation on every claim attempt.** Correct, but 4 to 10 ms slower than reading first.
+- **A private claim bitmap per thread** during renumbering. It saves a little time, but adds 2.6 MB in that phase, which would become the new memory peak.
 - **A spinning barrier between phases** instead of the standard one, which sleeps. Much slower locally (median 127 ms against 101 ms), because a spinning thread takes execution slots from its busy hyperthread sibling.
 
 ---

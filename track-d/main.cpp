@@ -348,6 +348,8 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
         // end or a way back to the root leaves a useless self-loop.
         while (!walks.empty()) {
           size_t kept = 0;
+          for (Walk &k : walks) // the offsets were fetched last round
+            __builtin_prefetch(&g.adj[g.off[k.at]]);
           for (Walk k : walks) {
             u32 ahead = 0, next = 0, end = ~0u;
             u64 nw = 0;
@@ -464,7 +466,9 @@ struct Side {
     }
     return p[v & (PG - 1)];
   }
-  void put(u32 i, u32 v) {
+  // Writes the entry either way and counts it only when `take`, so a
+  // relaxation needs no unpredictable branch.
+  void put(u32 i, u32 v, bool take = true) {
     u32 t = tail[i];
     if (t == ~0u || blk[t].n == BS) {
       u32 b = free;
@@ -476,12 +480,12 @@ struct Side {
       (t == ~0u ? head[i] : blk[t].next) = b;
       tail[i] = t = b;
     }
-    blk[t].v[blk[t].n++] = v, ++near;
+    blk[t].v[blk[t].n] = v, blk[t].n += take, near += take;
   }
-  void push(u64 d, u32 v) {
+  void push(u64 d, u32 v, bool take = true) {
     if ((d >> SH) - cur < NB)
-      put((d >> SH) & (NB - 1), v);
-    else
+      put((d >> SH) & (NB - 1), v, take);
+    else if (take)
       far.push({d, v});
   }
   void clear() {
@@ -525,11 +529,9 @@ struct Side {
         ++done;
         for (u32 e = g.off[u]; e < g.off[u + 1]; ++e) {
           u32 y = g.adj[e], v = y & HM;
-          u64 nd = d + weight(y, e, g.esc), &dv = at(v);
-          if (nd < dv) {
-            dv = nd, push(nd, v);
-            best = std::min(best, nd + o.get(v));
-          }
+          u64 nd = d + weight(y, e, g.esc), &dv = at(v), old = dv;
+          dv = std::min(nd, old), push(nd, v, nd < old);
+          best = std::min(best, nd + o.get(v));
         }
       }
     blk[tail[i]].next = free, free = head[i], head[i] = tail[i] = ~0u;
