@@ -1,7 +1,7 @@
 // Track A: per-hour, per-endpoint request counts, p50/p95/p99 and 5xx rates.
 // The log is nearly time-ordered: blocks are parsed into per-hour runs and an
 // hour is finalized once the finished file prefix is kLag hours past it.
-// A late line that breaks this is detected and the run is repeated exactly.
+// A late line that breaks this is detected and the run is repeated exactly
 #include <algorithm>
 #include <atomic>
 #include <charconv>
