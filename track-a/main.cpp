@@ -1,10 +1,10 @@
-// Speed Demon 2026, Track A (Ingest)
+// Speed Demon 2026, Track A (Ingest).
 //
 // One parallel region, three phases separated by barriers:
 // 1. Threads claim 1 MiB chunks of the mmap'd log, parse every line once and
-//    append a 4-byte record (20-bit latency, error bit, 11-bit thread-local
-//    endpoint id) to a per-thread bucket for its hour.
-//    Barrier: every distinct endpoint gets a global id in byte order.
+//    append a 4-byte record (20-bit latency, error bit, 11-bit endpoint id
+//    from one shared table) to a per-thread bucket for its hour.
+//    Barrier: endpoint ids are ranked in byte order, the output order.
 // 2. Hours, largest first: merge the hour's buckets, select the percentiles
 //    and keep per-group stats plus the exact size of the hour's output.
 //    Barrier: hour sizes become file offsets; the output file is mapped.
@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -28,7 +29,7 @@
 
 namespace {
 
-constexpr int HOURS = 72, MAX_EP = 2048, SLOTS = 4096, MAX_THREADS = 12;
+constexpr int HOURS = 72, MAX_EP = 2048, SLOTS = 16384, MAX_THREADS = 12;
 constexpr size_t CHUNK = 1 << 20, PAGE = 4096;
 // Latencies of 2^20 - 1 and up (about 1%) do not fit a record; they are kept
 // whole in a side list instead.
@@ -67,80 +68,161 @@ const char *find(const char *p, char c) {
   return p + __builtin_ctz(m);
 }
 
+uint32_t neq_mask(const char *a, const char *b) {
+  return ~uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(
+      _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a)),
+      _mm256_loadu_si256(reinterpret_cast<const __m256i *>(b)))));
+}
+
+// Compares 64 bytes at a time, masking the tail with bzhi: no length branch
+// for the 94% of traffic whose endpoint fits.
 bool same(const char *a, const char *b, uint32_t len) {
-  for (uint32_t i = 0;; i += 32) {
-    uint64_t diff = ~uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(
-        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a + i)),
-        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(b + i)))));
-    if (len - i <= 32)
-      return !(diff & ((1ull << (len - i)) - 1));
+  for (;; a += 64, b += 64, len -= 64) {
+    uint64_t diff = neq_mask(a, b) | uint64_t(neq_mask(a + 32, b + 32)) << 32;
+    if (len <= 64)
+      return !_bzhi_u64(diff, len);
     if (diff)
       return false;
   }
 }
 
+// Decimal digits of v: bit length * log10(2) estimates it, one table compare
+// corrects it.
 unsigned digits(uint32_t v) {
-  unsigned d = 1;
-  for (uint32_t p = 10; p <= v && d < 10; p *= 10)
-    ++d;
-  return d;
+  static const uint32_t pow10[] = {1,         10,        100,     1000,
+                                   10000,     100000,    1000000, 10000000,
+                                   100000000, 1000000000};
+  unsigned t = (32 - __builtin_clz(v | 1)) * 1233 >> 12;
+  return t + ((v | 1) >= pow10[t]);
 }
 
+// Writes v two digits at a time, right to left, from a pair table.
 char *put(char *o, uint32_t v) {
-  char *end = o + digits(v);
-  for (char *q = end; q > o; v /= 10)
-    *--q = char('0' + v % 10);
+  static const char pairs[] = "0001020304050607080910111213141516171819"
+                              "2021222324252627282930313233343536373839"
+                              "4041424344454647484950515253545556575859"
+                              "6061626364656667686970717273747576777879"
+                              "8081828384858687888990919293949596979899";
+  char *end = o + digits(v), *q = end;
+  for (; v >= 100; v /= 100)
+    std::memcpy(q -= 2, pairs + v % 100 * 2, 2);
+  if (v >= 10)
+    std::memcpy(q - 2, pairs + v * 2, 2);
+  else
+    q[-1] = char('0' + v);
   return end;
 }
 
-// Moves the elements of ranks rank[0..nr) (ascending) into their sorted
-// positions within v[lo, hi), with branch-free three-way partitions.
+// Latency digits start at s and end at the newline (at most 10). Branch-free:
+// the newline position comes from one compare, the digits are right-aligned
+// and combined pairwise with multiply-adds. Also returns the next line start.
+uint32_t parse_latency(const char *s, const char *&next) {
+  auto load = [](const char *p) {
+    return _mm_loadu_si128(reinterpret_cast<const __m128i *>(p));
+  };
+  int len = __builtin_ctz(
+      _mm_movemask_epi8(_mm_cmpeq_epi8(load(s), _mm_set1_epi8('\n'))));
+  next = s + len + 1;
+  __m128i v = _mm_subs_epu8(load(s + len - 16), _mm_set1_epi8('0'));
+  __m128i lane =
+      _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+  v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8(char(15 - len))));
+  v = _mm_maddubs_epi16(v, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1,
+                                         10, 1, 10, 1, 10, 1));
+  v = _mm_madd_epi16(v, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+  return uint32_t((uint64_t(_mm_extract_epi32(v, 1)) * 10000 +
+                   uint32_t(_mm_extract_epi32(v, 2))) *
+                      10000 +
+                  uint32_t(_mm_extract_epi32(v, 3)));
+}
+
+// Small ranges: an element holds rank r when # less <= r and # greater <=
+// n - 1 - r.
+// Eight candidates sit in one register while every element streams past, so
+// counting has no data-dependent branches. Lanes past n read neighbouring
+// values (scratch has slack) and are ignored.
+void select_small(const uint32_t *v, uint32_t n, const uint32_t *rank, int nr,
+                  uint32_t *out) {
+  const __m256i flip = _mm256_set1_epi32(INT32_MIN); // unsigned via signed
+  for (uint32_t i = 0; i < n; i += 8) {
+    __m256i x = _mm256_xor_si256(
+        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(v + i)), flip);
+    __m256i less = _mm256_setzero_si256(), more = less;
+    for (uint32_t j = 0; j < n; ++j) {
+      __m256i y = _mm256_set1_epi32(int(v[j] ^ 0x80000000u));
+      less = _mm256_sub_epi32(less, _mm256_cmpgt_epi32(x, y));
+      more = _mm256_sub_epi32(more, _mm256_cmpgt_epi32(y, x));
+    }
+    __m256i valid = _mm256_cmpgt_epi32(
+        _mm256_set1_epi32(int(n - i)), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+    for (int k = 0; k < nr; ++k) {
+      __m256i miss = _mm256_or_si256(
+          _mm256_cmpgt_epi32(less, _mm256_set1_epi32(int(rank[k]))),
+          _mm256_cmpgt_epi32(more, _mm256_set1_epi32(int(n - 1 - rank[k]))));
+      unsigned hit = _mm256_movemask_ps(
+          _mm256_castsi256_ps(_mm256_andnot_si256(miss, valid)));
+      out[k] = hit ? v[i + __builtin_ctz(hit)] : out[k];
+    }
+  }
+}
+
+// Finds the values of ranks rank[0..nr) (ascending) in v[lo, hi): branch-free
+// partitions narrow towards the ranks, then counting finishes.
 void select(uint32_t *v, uint32_t lo, uint32_t hi, const uint32_t *rank,
-            int nr) {
+            int nr, uint32_t *out) {
   while (nr) {
-    if (hi - lo <= 32) {
-      std::sort(v + lo, v + hi);
+    if (hi - lo <= 16) {
+      uint32_t local[3];
+      for (int k = 0; k < nr; ++k)
+        local[k] = rank[k] - lo;
+      select_small(v + lo, hi - lo, local, nr, out);
       return;
     }
     uint32_t a = v[lo], b = v[(lo + hi) / 2], c = v[hi - 1];
     uint32_t pivot = std::max(std::min(a, b), std::min(std::max(a, b), c));
-    uint32_t less = lo, upto;
+    uint32_t less = lo, upto = lo;
     for (uint32_t j = lo; j < hi; ++j) {
       uint32_t x = v[j];
       v[j] = v[less];
       v[less] = x;
       less += x < pivot;
     }
-    upto = less;
-    for (uint32_t j = less; j < hi; ++j) {
-      uint32_t x = v[j];
-      v[j] = v[upto];
-      v[upto] = x;
-      upto += x == pivot;
-    }
+    // Splitting off the pivot's copies is only needed for progress when
+    // nothing was smaller; otherwise [less, hi) already shrank.
+    if (less == lo)
+      for (uint32_t j = lo; j < hi; ++j) {
+        uint32_t x = v[j];
+        v[j] = v[upto];
+        v[upto] = x;
+        upto += x == pivot;
+      }
+    else
+      upto = less;
     int l = 0, r;
     while (l < nr && rank[l] < less)
       ++l;
     for (r = l; r < nr && rank[r] < upto; ++r)
       ;
-    select(v, lo, less, rank, l);
-    rank += r, nr -= r, lo = upto;
+    select(v, lo, less, rank, l, out);
+    for (int k = l; k < r; ++k)
+      out[k] = pivot;
+    rank += r, out += r, nr -= r, lo = upto;
   }
 }
 
-// Open-addressing endpoint table; names are copied into a compact arena so
-// comparisons do not chase the whole file.
+// One open-addressing endpoint table shared by every thread. A slot's key
+// packs hash, length and id, so a probe is one load and compare. A new name
+// (about 1842 per run) claims its slot as BUSY, is copied to its fixed-stride
+// arena row, then published with a release store; readers that meet BUSY
+// spin on that slot.
 struct Dictionary {
-  struct Slot {
-    uint32_t hash;
-    uint16_t len, id;
-    const char *name; // saves a dependent load through names[id]
-  };
-  Slot slots[SLOTS];
-  std::string_view names[MAX_EP];
-  char *arena = static_cast<char *>(std::malloc(MAX_EP * 128 + 32));
-  size_t used = 0;
-  unsigned size = 0;
+  static constexpr uint64_t BUSY = 1;
+  std::atomic<uint64_t> slots[SLOTS];
+  char names[MAX_EP + 1][128]; // the spare row keeps 64-byte compares in bounds
+  uint8_t lens[MAX_EP];
+  std::atomic<unsigned> size;
+
+  std::string_view name(unsigned id) const { return {names[id], lens[id]}; }
 
   uint32_t lookup(const char *s, uint32_t len) {
     uint64_t head = load8(s), tail = 0;
@@ -149,25 +231,30 @@ struct Dictionary {
     else
       tail = load8(s + len - 8);
     uint32_t hash = _mm_crc32_u64(_mm_crc32_u64(len, head), tail);
+    uint64_t want = uint64_t(hash) << 32 | len << 16;
     for (uint32_t i = hash;; ++i) {
-      Slot &sl = slots[i % SLOTS];
-      if (!sl.len) {
-        names[size] = {static_cast<char *>(std::memcpy(arena + used, s, len)),
-                       len};
-        used += len;
-        sl = {hash, uint16_t(len), uint16_t(size), names[size].data()};
-        return size++;
+      std::atomic<uint64_t> &slot = slots[i % SLOTS];
+      uint64_t key = slot.load(std::memory_order_acquire);
+      if (!key && slot.compare_exchange_strong(key, BUSY)) {
+        unsigned id = size++;
+        std::memcpy(names[id], s, len);
+        lens[id] = uint8_t(len);
+        slot.store(want | id, std::memory_order_release);
+        return id;
       }
-      if (sl.hash == hash && sl.len == len &&
-          same(s, sl.name, len))
-        return sl.id;
+      if (key <= BUSY) { // being inserted (or just claimed): look again
+        --i;
+        continue;
+      }
+      if ((key & ~0xFFFFull) == want && same(s, names[key & 0xFFFF], len))
+        return key & 0xFFFF;
     }
   }
 };
 
+Dictionary dict;
+
 struct Worker {
-  Dictionary local;
-  uint16_t remap[MAX_EP]; // local id -> output order
   void *base; // the pool's mapping; pool advances through it
   uint32_t *pool, *cur[HOURS], *limit[HOURS];
   std::vector<uint32_t *> blocks[HOURS];
@@ -187,36 +274,38 @@ struct Worker {
   void parse(const char *p, const char *end) {
     uint64_t key = 0;
     unsigned h = 0;
+    uint32_t *c = cur[0], *lim = limit[0]; // the current hour's bucket cursor
     while (p < end) {
-      if (load8(p + 5) != key) // bytes 5..12, "MM-DDTHH", identify the hour
+      if (load8(p + 5) != key) { // bytes 5..12, "MM-DDTHH", identify the hour
+        cur[h] = c, limit[h] = lim;
         key = load8(p + 5), h = hour_of(p);
+        c = cur[h], lim = limit[h];
+      }
       // Methods are 3 to 7 bytes, so the endpoint starts at p + 32..36.
       uint64_t m = eq_mask(p + 31, ' ') | uint64_t(eq_mask(p + 63, ' ')) << 32;
       const char *s = p + 32 + __builtin_ctzll(m);
       m &= m - 1;
       const char *e = m ? p + 31 + __builtin_ctzll(m) : find(p + 95, ' ');
-      uint32_t id = local.lookup(s, uint32_t(e - s)) | (e[1] == '5') << 11;
-      uint32_t v = 0;
-      for (p = e + 5; *p != '\n'; ++p)
-        v = v * 10 + uint32_t(*p - '0');
-      ++p;
+      uint32_t id = dict.lookup(s, uint32_t(e - s)) | (e[1] == '5') << 11;
+      uint32_t v = parse_latency(e + 5, p);
       if (v >= BIG) {
         big[h].push_back(uint64_t(v) << 12 | id);
         continue;
       }
-      if (cur[h] == limit[h]) {
-        blocks[h].push_back(cur[h] = pool);
-        limit[h] = pool += BLOCK;
+      if (c == lim) {
+        blocks[h].push_back(c = pool);
+        lim = pool += BLOCK;
       }
-      *cur[h]++ = v << 12 | id;
+      *c++ = v << 12 | id;
     }
+    cur[h] = c, limit[h] = lim;
   }
 };
 
 Worker workers[MAX_THREADS]; // zero pages, faulted in by their own threads
 unsigned threads, neps;
-Dictionary global;
-std::vector<uint16_t> sorted_ids; // output order -> global id
+std::vector<uint16_t> sorted_ids; // output order -> endpoint id
+uint16_t rank_of[MAX_EP];         // endpoint id -> output order
 int by_size[HOURS];               // hours, largest first
 struct Stat {
   uint32_t n, errors, p[3];
@@ -226,24 +315,15 @@ size_t hour_bytes[HOURS + 1];      // becomes each hour's file offset
 char *out;
 
 void merge() {
-  for (unsigned t = 0; t < threads; ++t)
-    for (unsigned l = 0; l < workers[t].local.size; ++l)
-      workers[t].remap[l] = uint16_t(global.lookup(
-          workers[t].local.names[l].data(),
-          uint32_t(workers[t].local.names[l].size())));
-  neps = global.size;
+  neps = dict.size;
   sorted_ids.resize(neps);
-  std::vector<uint16_t> rank(neps);
   for (unsigned g = 0; g < neps; ++g)
     sorted_ids[g] = uint16_t(g);
   std::sort(sorted_ids.begin(), sorted_ids.end(), [](uint16_t a, uint16_t b) {
-    return global.names[a] < global.names[b];
+    return dict.name(a) < dict.name(b);
   });
   for (unsigned k = 0; k < neps; ++k)
-    rank[sorted_ids[k]] = uint16_t(k);
-  for (unsigned t = 0; t < threads; ++t)
-    for (unsigned l = 0; l < workers[t].local.size; ++l)
-      workers[t].remap[l] = rank[workers[t].remap[l]];
+    rank_of[sorted_ids[k]] = uint16_t(k);
   // Hour sizes, rounded up to whole blocks, schedule phase 2 and bound its
   // scratch buffers.
   size_t lines[HOURS] = {};
@@ -256,7 +336,7 @@ void merge() {
             [&](int a, int b) { return lines[a] > lines[b]; });
   for (unsigned t = 0; t < threads; ++t)
     workers[t].scratch =
-        static_cast<uint32_t *>(std::malloc(lines[by_size[0]] * 4 + 4));
+        static_cast<uint32_t *>(std::malloc(lines[by_size[0]] * 4 + 32));
   stats = static_cast<Stat *>(std::calloc(size_t(HOURS) * neps, sizeof(Stat)));
 }
 
@@ -266,7 +346,7 @@ void aggregate(Worker &me, int h) {
   std::fill_n(err, neps, 0);
   for (unsigned t = 0; t < threads; ++t)
     workers[t].each_record(h, [&](uint64_t r) {
-      unsigned g = workers[t].remap[r & 2047];
+      unsigned g = rank_of[r & 2047];
       ++cnt[g];
       err[g] += r >> 11 & 1;
     });
@@ -275,7 +355,7 @@ void aggregate(Worker &me, int h) {
     off[g] = acc, acc += cnt[g];
   for (unsigned t = 0; t < threads; ++t)
     workers[t].each_record(h, [&](uint64_t r) {
-      v[off[workers[t].remap[r & 2047]]++] = uint32_t(r >> 12);
+      v[off[rank_of[r & 2047]]++] = uint32_t(r >> 12);
     });
   // Line: 21-byte hour stamp with its space, name, six numbers each after a
   // space, newline.
@@ -287,10 +367,10 @@ void aggregate(Worker &me, int h) {
     uint32_t *vg = v + off[g] - n; // off[g] now marks the end of group g
     uint32_t rank[3] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1,
                         (99 * n + 99) / 100 - 1};
-    select(vg, 0, n, rank, 3);
     Stat &s = stats[size_t(h) * neps + g];
-    s = {n, err[g], {vg[rank[0]], vg[rank[1]], vg[rank[2]]}};
-    bytes += 28 + global.names[sorted_ids[g]].size() + digits(n) +
+    s = {n, err[g], {}};
+    select(vg, 0, n, rank, 3, s.p);
+    bytes += 28 + dict.lens[sorted_ids[g]] + digits(n) +
              digits(s.p[0]) + digits(s.p[1]) + digits(s.p[2]) +
              digits(s.errors) +
              digits(uint32_t(uint64_t(s.errors) * 1000000 / n));
@@ -308,7 +388,7 @@ void format(int h) {
     const Stat &s = stats[size_t(h) * neps + g];
     if (!s.n)
       continue;
-    std::string_view name = global.names[sorted_ids[g]];
+    std::string_view name = dict.name(sorted_ids[g]);
     std::memcpy(o, stamp, 21);
     std::memcpy(o + 21, name.data(), name.size());
     o += 21 + name.size();
@@ -329,6 +409,9 @@ void format(int h) {
 } // namespace
 
 int main(int argc, char **argv) {
+  // With THP on "always", every thread's malloc arena, stack and the stats
+  // table would be charged a whole 2 MiB page; small pages keep M honest.
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   std::string_view in_dir = argc > 2 ? argv[1] : "/data";
   std::string_view out_dir = argc > 2 ? argv[2] : "/out";
   int fd = open((std::string(in_dir) + "/requests.log").c_str(), O_RDONLY);

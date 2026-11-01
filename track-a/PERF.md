@@ -84,6 +84,38 @@ Phase-1 floor: replacing the parser with a bare 32-byte load sweep over the same
 
 Verification for step 4: 17 datasets byte-identical to the Python reference. That is the 15 from step 3, plus a freshly generated full seed 99 and full seed 1 with every line shuffled (no time locality). AddressSanitizer + UBSan and ThreadSanitizer are clean on the small and medium inputs. `check.py` passes with the real Dockerfile. Raw timings: `dev/results/native/onepass-vs-hourstream-time-*.txt`. Every intermediate candidate is kept as `dev/onepass*_candidate.cpp`.
 
+## Step 4 on the board, and step 5: removing branch mispredictions (2026-11-01)
+
+**Board result for step 4** (as reported from the leaderboard; run ID not recorded): **0.026 s, 38 MB, 358 lines, K 37.87, 78.9 points, rank 32.** Leaders at the time: K 56.90 (0.016 s / 17 MB / 346 lines) and K 55.68 (0.018 s / 16 MB / 294 lines).
+
+Two things the board showed that local runs had hidden:
+
+- **Memory 38 MB versus 25 MiB locally.** The local Docker VM runs transparent huge pages in `madvise` mode; Debian kernels default to `always`. Under `always`, per-thread malloc arenas, thread stacks and the `calloc`'d stats table can each be charged whole 2 MiB pages. Step 5 calls `prctl(PR_SET_THP_DISABLE)` at startup. This is a hypothesis until the next board run: changing the VM's system-wide THP setting to reproduce it was not permitted, and locally the call changes nothing (25.0 MiB before and after).
+- **The board is compute-bound.** It runs at a fixed 2.5 GHz without turbo, while the laptop boosts its cores. So cost is now measured as instruction count and simulated branch mispredictions: valgrind cachegrind, one thread, full seed 1, deterministic run to run. A simple model, wall ≈ (Ir / 2.5 + 17 × mispredicts) cycles / (2.5 GHz × ~7.5 effective cores) + ~3 ms, reproduces step 4's 26 ms (Ir 755M, 7.58M mispredicts).
+
+| Change (cumulative) | Ir (M) | Mispredicts (M) | Notes |
+|---|---:|---:|---|
+| Step 4 as submitted (+ THP disable) | 755.6 | 7.58 | latency digit loop alone: 38% of mispredicts; `same()` length branch: 27% |
+| SIMD latency parse; 64-byte `same()` with a `bzhi` tail mask; `clz`-based digit count; pair-table formatting; `&` instead of `&&` in the slot check | 693.4 | 3.49 | |
+| Leaves of the multi-select (≤16 values, and whole small groups) by vectorised rank counting: 8 candidates per register, all values streamed past, the rank picked by mask compare plus `tzcnt` | 698.4 | 1.99 | selection had been 64% of all mispredicts (measured by removing it) |
+| One endpoint table shared by all threads (CAS-claimed slots, release-published keys, 64-bit packed hash/len/id key), replacing per-thread tables and the serial 22k-lookup merge | 682.6 | 2.03 | -2.2 MiB, -10 lines; ThreadSanitizer clean |
+| Single-pass partition: split off the pivot's copies only when nothing was smaller | 645.3 | 1.99 | the all-equal 383k-value group in `late-endpoint` still passes |
+| 16,384-slot shared table (was 4,096) | 641.1 | 1.66 | fewer probe collisions; +96 KiB |
+| Current hour's bucket cursor kept in registers | 627.6 | 1.66 | |
+
+Total: Ir -17%, mispredicts -78%. The model predicts ~18 ms on the board, down from 26 ms. Laptop wall time (21 alternating runs, `/out` on ext4): step 4 + THP disable 22.2 ms, step 5 **18.2 ms**; total CPU 213 to 164 ms. Local peak memory 23.6 MiB (was 25.0). Code lines 416 (was 358).
+
+Rejected in step 5:
+
+- Scalar O(n²) rank counting for small groups (+37M Ir: the inner loop's varying trip count mispredicts).
+- Histogram (bucketed) selection for groups of 512 or more (-0.6% Ir only).
+- Inline 56-byte name prefixes in 64-byte slots (slower, +3 MiB).
+- Branch-free fixed 10-digit formatting via a line buffer (+54M Ir).
+- 96-byte endpoint-end window (no change).
+- Releasing the first wave of hours' records early (-2.4 MiB but +9% wall, net negative K).
+
+Verification for step 5: 17 datasets byte-identical, 3 runs each; ThreadSanitizer and ASan/UBSan clean on 13 small and medium inputs; `check.py` passes with the real Dockerfile. Candidates kept in `dev/` (`branchless_`, `vpick16_`, `shared_dict_`, `lomuto_`, `slots16384_`, `cursor_candidate.cpp`).
+
 ## Protocol and evidence
 
 - Full seed-1 input: 3,100,000 records, 238,836,234 bytes.
