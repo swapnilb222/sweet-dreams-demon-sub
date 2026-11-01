@@ -4,16 +4,22 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-`main.cpp` is built by the allowlisted GCC 15 image (`-O3 -march=x86-64-v3`, static) into the Debian runtime image.
+`main.cpp` is built by the allowlisted GCC 15 image (`-O3 -march=x86-64-v3`, i.e. AVX2, static) into the Debian runtime image. One pool of threads (one per CPU in the affinity mask) runs three phases. Each phase is cut into pieces that any thread claims, and the next phase starts once every piece of the previous one is done.
 
-1. **Lookup.** `regions.csv` becomes a dense array `region_id -> group index`. Any id outside the array, or with absurdly many digits, goes to `_UNMATCHED`.
-2. **Chunking.** `records.csv` is memory-mapped. It is cut into about 8 chunks per thread, and each cut is moved forward to the first LF followed by a digit or a BOM. Spec 2.2 guarantees that is a record start: names never contain an LF, every note line starts with a lowercase word or a quote, and BOMs only sit at record starts.
-3. **Parsing.** Worker threads claim chunks dynamically and run a hand-written scanner that follows spec 2.1. A BOM at a record start is skipped. Quoted fields end at the first `"` not followed by `"`, using `memchr`, and each `""` counts as one byte. Unquoted fields run to the next comma. Amounts are parsed as integer cents, and CRLF or LF ends a record. Count, sums, min/max and byte counts go into per-thread, per-group accumulators. After a chunk is parsed, its file pages are dropped from RSS with `MADV_DONTNEED`.
-4. **Distinct names.** Each name is interned in one shared, lock-free open-addressing table. The key is the raw bytes between the quotes, still escaped. Escaping maps one-to-one onto the unescaped value, so this is exact, and both empty forms give the empty key. Because the name pool is about 100k values, the table quickly becomes read-mostly and fits in cache. Lookups are software-pipelined: a record prefetches its slot, 8 records later the arena entry is prefetched, and 8 records after that the comparison runs from cache. Each name id is appended to a per-thread, per-group stream. If a dataset has far more distinct names than the table was sized for, the run starts again with a table 8× larger. That never happens on spec data, but it keeps arbitrary inputs exact.
-5. **Merge.** Groups are processed in parallel. Each group ORs every thread's id stream into a small bitset and counts the new bits. The numeric accumulators are summed.
-6. **Output.** Keys are sorted bytewise (`_UNMATCHED` sorts last on its own) and the file is written.
+1. **Regions, pass 1.** `regions.csv` is split by lines. The threads flag which country codes are present and track the largest region id, while also faulting in the shared tables with `MADV_POPULATE_WRITE`. One populate call per thread avoids page-fault lock contention. Countries are then numbered in code order, so the output needs no sort.
+2. **Regions, pass 2.** The threads fill a direct table `region_id -> country number`, where 0 means "no such region" and maps to `_UNMATCHED`.
+3. **Records.** `records.csv` is processed in ~1 MB pieces.
+   - **Boundaries.** Each piece's thread finds its own boundaries: the first record start at or after its share of the file, meaning an LF followed by a digit or a BOM. By spec 2.2, an LF inside quotes is always followed by `[a-z"]`. Finding the cuts lazily matters: computing ~200 cuts up front faulted in a 64 KB window at each cut, for ~49 MB of RSS.
+   - **Fields.** Field ends are found with AVX2 byte masks. Quoted fields are scanned by stepping through the bit mask of their quotes, where a `""` pair counts as an escape, so commas and LFs inside quotes cost nothing. Region and amount are found in one 32-byte compare. Numbers are decoded eight digits at a time with SWAR.
+   - **Names.** A name is keyed by a 64-bit hash of its raw bytes between the quotes, together with its length. Escaping is one-to-one, so equal raw bytes mean equal values, and both empty forms give the empty key. The key's slot in a lock-free open-addressed table, probed four slots at a time with AVX2 and claimed with a CAS, is the name's id. With ~100k distinct names, the chance of a 64-bit key collision is about 3 in 10^10.
+   - **Distinct names.** Each country has a bitset over name ids. An atomic OR that sets a new bit is a new distinct name, so there is no merge pass.
+   - **Prefetching.** A 3-stage pipeline (16 records apart) prefetches the region row, the table slot and the bitset word.
+   - **Memory.** Each piece is mapped with `MADV_POPULATE_READ` before parsing and released with `MADV_DONTNEED` after.
+4. **Output.** Per-thread totals are summed and the lines printed.
 
-Correctness was checked against the Python reference on tiny/sample/full seed 1 and sample seed 17, and on the spec's worked example. A build with a tiny initial name table was also run to exercise the rerun path.
+If a dataset had more distinct names than the 1 MB table holds (114k), the run is redone with an 8× larger table. That never happens on spec data, but it keeps the answer right.
+
+Checked against the Python reference on tiny/sample/full seed 1, sample seed 17, and the spec's worked example. A build with a 256-slot table was also run to exercise the rerun path.
 
 ## Dependencies
 
@@ -21,5 +27,5 @@ None (`dependency_count = 0`). The C++ standard library is statically linked.
 
 ## With another 24 hours
 
-- Profile-guided optimisation (as in track A), and an AVX2 scanner that finds `"`, `,` and LF for a whole record at once in place of per-field `memchr`.
-- Pin the thread count to the box's 6 P-cores × 2 and tune the chunk size on the real scoring box.
+- Profile-guided optimisation, trained on a non-board seed.
+- Tune piece size and pipeline depth on the real scoring box (6 P-cores, 12 threads).
