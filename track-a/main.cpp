@@ -474,11 +474,6 @@ int main(int argc, char **argv) {
       // A chunk owns the lines that start inside it.
       const char *p = c ? find(data + c * CHUNK - 1, '\n') + 1 : data;
       workers[t].parse(p, data + std::min((c + 1) * CHUNK, size));
-      // Drop the chunk's page-table entries now, in parallel, rather than
-      // serially at exit; the page cache keeps the data. Never past EOF:
-      // that would zero whatever memory follows the mapping.
-      madvise(const_cast<char *>(data) + c * CHUNK,
-              std::min(CHUNK, size - c * CHUNK), MADV_DONTNEED);
     }
     merged.arrive_and_wait();
     for (int i; (i = next_hour.fetch_add(1)) < HOURS;)
