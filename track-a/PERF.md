@@ -177,6 +177,25 @@ Board experiments, regenerated on step 7 and validated 17/17: `dev/board_exp_nom
 
 Verification for step 7: 17 datasets, 3 runs; ThreadSanitizer and ASan/UBSan clean on 10 small and medium inputs; `check.py` passes.
 
+## Step 8: streaming-finalize architecture (2026-11-01)
+
+Three alternative implementations from the team's notes (`tracka_ref.cpp`, `tracka_ref2.cpp`, `tracka_ref3.cpp`) were built with the track's flags and measured against step 7 with the same harnesses. All pass the 17 datasets (ref1 identifies endpoints by hash equality alone, which is not exact in general).
+
+| Version | Ir (M) | Mispredicts (M) | Peak memory (MiB, `/out` ext4) | CPU (ms) | Lines |
+|---|---:|---:|---:|---:|---:|
+| Step 7 (two-phase, ours) | 593.6 | 1.67 | 22.8 | 242 | 422 |
+| ref1 (per-hour block chains, full sort) | 823.8 | 23.65 | | | 338 |
+| **ref2 (streaming finalize)** | **528.5** | **0.85** | **14.0-19.4** | **203** | 576 |
+| ref3 (two-phase, chunks released in batches) | 746.7 | 3.52 | 21.8 | 264 | 327 |
+
+Why ref2 is cheaper: the log is nearly time-ordered, so it finalises each hour once the finished file prefix is two hours past it, overlapping aggregation with parsing. If a line turns up after its hour was finalised, the whole run repeats with finalisation deferred to the end, so the result is always exact (the shuffled-input fixture exercises that path). Only a few hours of records are resident at once. Output is appended in hour order and its page cache is dropped after `sync_file_range` writeback, so the 10 MB output never counts in full. Its parser runs four interleaved streams per block with prefetch, SWAR latency decoding and per-thread mirrors of an append-only dictionary. Selection uses a vector compress-partition and a 16-lane bitonic network.
+
+Local wall time: level with step 7 when `/out` is tmpfs (17.9 vs 17.2 ms), slower with `/out` on the VM's ext4 volume (36.3 vs 27.5 ms), where per-hour writeback goes to a slow virtual disk. It is also slower when the laptop is heavily loaded, because the pipeline waits on parse progress. The board's NVMe-backed output directory should be much kinder to the writeback, but only a board run can say.
+
+**Step 8 `main.cpp`** = ref2 + `prctl(PR_SET_THP_DISABLE)` (ref2 mallocs per-hour run buffers from per-thread arenas, which is exactly the THP exposure that cost step 4 12 MB on the board) + argument paths (`/data`, `/out` by default). Ir and mispredicts are unchanged from ref2. Projected board K at about 15 MB and 582 lines: about 49 at 19.5 ms, about 52.6 at 17 ms, and about 46 if writeback costs it 22 ms. Step 7 is kept as `dev/onepass_step7_candidate.cpp`; revert to it if the board run is worse.
+
+Verification for step 8: 17 datasets byte-identical, 3 runs; ThreadSanitizer and ASan/UBSan clean on 11 inputs including the rerun path; `check.py` passes with the real Dockerfile.
+
 ## Protocol and evidence
 
 - Full seed-1 input: 3,100,000 records, 238,836,234 bytes.
