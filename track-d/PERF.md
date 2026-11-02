@@ -48,7 +48,7 @@ Each step is one push. A push is run once per team, so most steps have two board
 | 24 | 16-bit distance labels, with an exact 64-bit rerun (busy box: Track A 6% and 10% slow) | ca05322 | run-c43ea24c24c4, run-f85df36b8aba | 0.0855 | 58.6 | 587 | 33.96 | 76.55 |
 | 25 | Step 24 in 8 fewer lines (busy box: Track A 20% slow) | 5f88cb7 | run-0615a8689401 | 0.0854 | 58.4 | 579 | 34.08 | 76.63 |
 | 26 | Step 25 rerun, PERF.md only (quiet box: Track A normal) | 6d8a4be | run-b2d9282c5a33 | 0.0960 | 56.2 | 579 | 30.69 | 75.52 |
-| 27 | Back to step 23's code, minus the same 8 header lines (identical machine code) | see git log | | | | 570 | | |
+| 27 | Back to step 23's code, minus the same 8 header lines (identical machine code; busy box: Track A 25% slow) | 35dca0f | run-a291b921cb21 | 0.0902 | 58.5 | 570 | 33.22 | 76.08 |
 
 ---
 
