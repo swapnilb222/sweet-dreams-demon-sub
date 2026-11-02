@@ -68,30 +68,6 @@ static void merge(Esc &into, std::vector<Esc> &parts) {
   std::stable_sort(into.begin(), into.end(),
                    [](auto &a, auto &b) { return a.first < b.first; });
 }
-// The reverse graph lives in 2 MiB pages: the searches hop around it at
-// random, and with small pages most hops would miss the TLB. Only the
-// aligned body of an array gets them, so rounding wastes nothing. Huge pages
-// are allowed only while those bodies are faulted in, by all threads at once.
-using Body = std::vector<std::pair<char *, size_t>>;
-static u32 *huge(size_t n, Body &body) {
-  size_t H = size_t(1) << 21;
-  auto *p = static_cast<char *>(mmap(nullptr, n * 4 + H, PROT_READ | PROT_WRITE,
-                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-  p += (H - uintptr_t(p) % H) % H;
-  body.push_back({p, n * 4 / H * H});
-  madvise(p, body.back().second, MADV_HUGEPAGE);
-  return reinterpret_cast<u32 *>(p);
-}
-static void fault(const Body &body) {
-  prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
-  par([&](unsigned t) {
-    for (auto [p, len] : body) { // a share of whole huge pages per thread
-      size_t k = len >> 21, a = k * t / NT, b = k * (t + 1) / NT;
-      madvise(p + (a << 21), (b - a) << 21, MADV_POPULATE_WRITE);
-    }
-  });
-  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-}
 struct Csr {
   Buf<u32> off, adj;
   Esc esc;
@@ -450,11 +426,7 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
   Csr f;
   f.off.reset(rows + n0), f.adj.reset(rows + n0 + n + 1);
   drop(f.adj.get(), end); // the edges fill in as the copies are read
-  // Never freed (the process exits first), so mmap memory is fine here. The
-  // reverse edges are faulted in once the copies are gone.
-  Body now, later;
-  rv.off.reset(huge(n + 1, now)), rv.adj.reset(huge(es[NT], later));
-  fault(now);
+  rv.off = buf<u32>(n + 1), rv.adj = buf<u32>(es[NT]);
   f.off[n] = rv.off[n] = es[NT];
   std::vector<Esc> esc(NT);
   Boxes box(NT, std::vector<std::vector<In>>(NT));
@@ -487,7 +459,7 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
   merge(f.esc, esc);
   for (auto &[s, t] : qs)
     s = id[s], t = id[t];
-  drop(id, id + n0), fault(later);
+  drop(id, id + n0);
   reverse(f, rv, vs, box);
   return f;
 }

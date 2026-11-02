@@ -17,8 +17,9 @@ Every step from the reference to the current version. Each step lists the live-b
 | 10 | Raw graph stored as four fixed slots per node | 65cc5ce | run-4efb9302d30e | **0.089** | **57.8** | **593** | **33.25** | **76.09** |
 | 11 | The raw graph's pages reused for the id map and forward offsets | 5491bc8 | run-940c564ae383 | 0.089 | 59.0 | 600 | 33.08 | 75.98 |
 | 12 | The input file unmapped by the parsing threads, not at exit | 6c0a85d | run-225c1dc47a94 | 0.095 | 56.0 | 601 | 32.31 | 75.57 |
-| 13 | Step 11 again: step 12 reverted | 11cca82 | pending | | | | | |
-| 14 | Board test: the reverse graph in 2 MiB pages | pending | pending | | | | | |
+| 13 | Step 11 again: step 12 reverted | 11cca82 | not run separately | | | | | |
+| 14 | Board test: the reverse graph in 2 MiB pages | 99aef00 | run-719b42059767 | 0.089 | 57.4 | 622 | 33.15 | 76.03 |
+| 15 | Step 11 again: step 14 reverted | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -153,6 +154,8 @@ The scoring CPU's second-level TLB holds 2,048 page translations. With 4 KB page
 Huge pages are switched off for the whole process from the start (step 3), because partly used buffers would round up to 2 MiB and raise memory. They are allowed only for the reverse graph's offsets and edges, and only for the 2 MiB-aligned body of each array, so rounding wastes nothing. Each array is faulted in by all threads at once, each taking whole huge pages. The offsets are faulted in before the rename pass, which zeroes them anyway. The edges are faulted in once the edge copies are gone. That keeps the memory peak where it was. The forward graph stays on small pages: its offsets reuse the raw graph's pages (step 11), and faulting its edges early would raise the peak.
 
 On our laptop this is about 3 ms slower, but there every new huge page also faults in the virtual machine's host, which the scoring machine does not have. Memory is unchanged and it is 22 lines longer. If both board runs are slower than step 11, we revert it.
+
+*Board result: 0.0890 s (run-719b42059767) and 0.0907 s (run-f60f3a5c7751), against 0.0893 s and 0.0909 s for step 11. The same speed within noise, so TLB misses on the reverse graph are not what limits the searches on that CPU. With 22 more lines it scores lower, so step 15 goes back to step 11's code.*
 
 ---
 
