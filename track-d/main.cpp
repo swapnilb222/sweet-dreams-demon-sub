@@ -86,6 +86,13 @@ static std::pair<u32, u32> row(const u32 *adj, u32 u) {
                      (x[3] != NONE)};
 }
 
+// Hands the whole pages inside [a, b) back to the kernel.
+static void drop(void *a, void *b) {
+  uintptr_t lo = (uintptr_t(a) + 4095) & ~uintptr_t(4095), hi = uintptr_t(b) & ~uintptr_t(4095);
+  if (lo < hi)
+    madvise(reinterpret_cast<void *>(lo), hi - lo, MADV_DONTNEED);
+}
+
 // The file followed by zeros, so an 8-byte load at any byte stays mapped.
 static const char *map(const std::string &path, size_t &len) {
   int fd = open(path.c_str(), O_RDONLY);
@@ -291,8 +298,8 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
   // Claims race without locked instructions, so a racing store can lose a bit
   // and a node can be claimed twice. The extra copy is harmless (heads resolve
   // through one id entry, so no edge reaches it), unless the copies push the
-  // node count past the head field or a thread's edge buffer: then the pass
-  // reruns with atomic claims.
+  // node or edge count past the raw graph's, or a thread's edge buffer: then
+  // the pass reruns with atomic claims.
   std::vector<std::atomic<u64>> taken((n >> 6) + 1);
   std::vector<Region> reg(NT);
   std::vector<u32> vs(NT + 1, 0), es(NT + 1, 0);
@@ -398,15 +405,18 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
   for (unsigned t = 0; t < NT; ++t)
     vs[t + 1] = vs[t] + u32(reg[t].ord.size()),
            es[t + 1] = es[t] + reg[t].m;
-  if (vs[NT] <= HM + 1 && !full)
+  if (vs[NT] <= n && es[NT] <= g.m && !full)
     break;
   for (auto &w : taken)
     w = 0;
   for (auto &r : reg)
     r = {};
   }
+  // The raw rows are done with. Their pages, already faulted in, become the
+  // id map and the forward graph, which fit as the counts did not grow. The
+  // process exits before any of them would be freed.
+  u32 n0 = n, *rows = g.adj.release(), *id = rows, *end = rows + 4 * n0 + g.m;
   g = {};
-  auto id = buf<u32>(n);
   par([&](unsigned t) {
     for (u32 i = 0; i < reg[t].ord.size(); ++i)
       id[reg[t].ord[i]] = vs[t] + i;
@@ -414,7 +424,8 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
   });
   n = vs[NT];
   Csr f;
-  f.off = buf<u32>(n + 1), f.adj = buf<u32>(es[NT]);
+  f.off.reset(rows + n0), f.adj.reset(rows + n0 + n + 1);
+  drop(f.adj.get(), end); // the edges fill in as the copies are read
   rv.off = buf<u32>(n + 1), rv.adj = buf<u32>(es[NT]);
   f.off[n] = rv.off[n] = es[NT];
   std::vector<Esc> esc(NT);
@@ -424,7 +435,7 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
     auto w = r.wide.begin();
     u32 lo = vs[t], hi = vs[t + 1], m = es[t + 1] - es[t];
     u32 *__restrict a = &f.adj[es[t]], *__restrict ro = rv.off.get();
-    const u32 *__restrict out = r.out.get(), *__restrict ids = id.get();
+    const u32 *__restrict out = r.out.get(), *__restrict ids = id;
     std::fill(&ro[lo], &ro[hi], 0);
     // Renames heads and counts the reverse degrees of this thread's slice.
     for (u32 u = lo, j = 0; u < hi; ++u) {
@@ -448,7 +459,7 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
   merge(f.esc, esc);
   for (auto &[s, t] : qs)
     s = id[s], t = id[t];
-  id.reset();
+  drop(id, id + n0);
   reverse(f, rv, vs, box);
   return f;
 }

@@ -13,8 +13,9 @@ Every step from the reference to the current version. Each step lists the live-b
 | 6 | Correctness fix in renumbering, profile-guided static build, parallel teardown, fused reverse pass | 93ab427 | run-7e04fad34160 | 0.113 | 55.4 | 569 | 29.99 | 73.85 |
 | 7 | Step 6 without the parallel teardown; cheap racy claims again, with an exact fallback | 93a6c1c | run-b0e091cfc395 | 0.109 | 55.3 | 571 | 30.63 | 74.30 |
 | 8 | Prefetched chain walks, branch-free relaxation | 240b78d | run-b11110b169c2 | 0.100 | 54.9 | 571 | 31.95 | 75.22 |
-| 9 | Hot loops rewritten so the compiler can keep their values in registers | d88f3f8 | run-460785953528 | **0.096** | **57.3** | **578** | **32.25** | **75.43** |
-| 10 | Raw graph stored as four fixed slots per node | pending | pending | | | | | |
+| 9 | Hot loops rewritten so the compiler can keep their values in registers | d88f3f8 | run-460785953528 | 0.096 | 57.3 | 578 | 32.25 | 75.43 |
+| 10 | Raw graph stored as four fixed slots per node | 65cc5ce | run-4efb9302d30e | **0.089** | **57.8** | **593** | **33.25** | **76.09** |
+| 11 | The raw graph's pages reused for the id map and forward offsets | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -118,6 +119,19 @@ To keep the markers unambiguous, the head field is now sized from n + 1 instead 
 
 The renumbering phase dropped from about 24 to 20–21 ms. Locally, over 20 interleaved runs with the board's build, step 10 measured 77 / 79 / 83 ms (minimum / first quartile / median), against 79 / 86 / 91 ms for step 9. It is 15 lines longer, and memory is unchanged.
 
+*Board result: 0.089 s (run-4efb9302d30e) and 0.096 s (run-99192c439592). Both runs used the same commit. Their 8% gap is the board's run-to-run noise, which is why we judge every change on both runs and on local interleaved runs.*
+
+### Step 11: reuse pages instead of faulting in new ones
+A profile showed the kernel's page-fault path taking about 8% of all CPU time. Over a run the program writes about 140 MB of fresh memory: input bins, raw graph, edge copies, final graphs. Each new 4 KB page costs a fault, a zeroing of the page and a memory-accounting update, and threads faulting at once contend on kernel locks. The run took about 37,000 faults.
+
+When the renumbering ends, the raw graph (about 28 MB, already faulted in) is freed. Right after that, the program used to allocate the id map (old id to new id) and the forward offsets, about 12 MB, and fault them in page by page. Now those two arrays are simply placed in the raw graph's old pages, which are already resident. The rest of the raw graph's pages go back to the kernel at once.
+
+We also tried placing the forward edges there. That saved more faults, but it raised the memory peak by 3 MB. Those pages would all be resident from the start of the rename pass, while the edge copies are still alive, and normally the edges fill in as finished threads free their copies.
+
+The new placement can only fit if the new graph is no larger than the raw one. That was already nearly guaranteed: contraction only removes nodes, and the exact fallback in the renumbering (step 7) now also covers the node and edge counts, not just the id field.
+
+The rename phase dropped from about 10.7 to 8.6 ms, and memory is unchanged. Locally, over 20 interleaved runs with the board's build, step 11 measured 80 / 90 / 93 ms (minimum / first quartile / median), against 86 / 94 / 97 ms for step 10, on a slower stretch of the machine. It is 7 lines longer.
+
 ---
 
 ## Things we tried that did not help
@@ -139,6 +153,7 @@ Each idea was measured against the version before it and dropped when it did not
 - **Renaming edges in equal slices of new ids.** The renumbering regions differ in size by up to 2x, so the rename pass looked unbalanced. Equal slices were slower, though, because their boundaries no longer match the regions, and many more edges then crossed between slices.
 - **Letting threads take seeds from each other's id range.** Region sizes stayed just as uneven, which showed that they reflect thread speed (two threads share each core), not idle threads.
 - **16-bit search labels.** Another implementation uses them. In our tests its query phase was slower than ours.
+- **Profile training on a full-size input, and tuning for the scoring CPU's core type** (`-mtune=alderlake`, same instruction set). Neither was measurably faster than the plain sample-trained build.
 - **A private claim bitmap per thread** during renumbering. It saves a little time, but adds 2.6 MB in that phase, which would become the new memory peak.
 - **A spinning barrier between phases** instead of the standard one, which sleeps. Much slower locally (median 127 ms against 101 ms), because a spinning thread takes execution slots from its busy hyperthread sibling.
 
