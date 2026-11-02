@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-`main.cpp` is built by the allowlisted GCC 15 image, statically, with `-O3 -march=raptorlake`, because the scoring box is an Intel i5-13500 (Raptor Lake: AVX2, AES-NI, PCLMUL, BMI2, no AVX-512). It runs one thread per physical core: half the CPUs in the affinity mask, so 6 on the box, whose 12 CPUs are 6 cores with two hyperthreads each.
+`main.cpp` is built by the allowlisted GCC 15 image, statically, with `-O3 -march=raptorlake`, because the scoring box is an Intel i5-13500 (Raptor Lake: AVX2, AES-NI, PCLMUL, BMI2, no AVX-512). It runs one thread per CPU in the affinity mask, which is 12 on the box (6 P-cores × 2 hyperthreads; one thread per core measured slower).
 
 1. **Start-up.** Both files are mapped, each followed by 64 KB of zero pages so wide loads may run past the end. All threads meet at a barrier before any page is faulted in, because a page fault holds up thread creation (that cost 1.5 ms).
 2. **Regions.** Each thread parses a slice of `regions.csv` into a direct table `region_id -> group`, where 0 means `_UNMATCHED`. A country gets a group number the first time it is seen, through `call_once`. Meanwhile two threads fault in the two huge pages that hold the name buckets (1 MB) and the start of the bitset. No other thread touches them yet: racing huge-page faults each allocate, and are charged for, a 2 MB page.

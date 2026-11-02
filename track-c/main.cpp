@@ -1,4 +1,4 @@
-// Speed Demon 2026, Track C (Join). v29: v27 with one thread per physical core.
+// Speed Demon 2026, Track C (Join). v27: the same engine in fewer lines.
 //
 // Threads: one per CPU in the affinity mask. They parse regions.csv in T
 // slices into a direct table region_id -> group (0 = unmatched), meet at a
@@ -181,9 +181,7 @@ static void work(u64 t) {
 
 int main() {
   cpu_set_t cs;
-  // One thread per core: the box runs 12 CPUs as 6 cores x 2 hyperthreads, and
-  // two threads of this loop on one core share its L1 and fill buffers.
-  sched_getaffinity(0, sizeof cs, &cs), T = max(1, CPU_COUNT(&cs) / 2);
+  sched_getaffinity(0, sizeof cs, &cs), T = CPU_COUNT(&cs);
   memset(keep, -1, 32), in = open_map("/data/records.csv", len);
   rg = open_map("/data/regions.csv", rlen);
   // Regions are listed in ascending id order: the last line has the largest.
