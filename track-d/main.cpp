@@ -153,13 +153,14 @@ static Csr read_graph(const std::string &path, u32 &n,
           mmap(nullptr, b.cap * sizeof(Chunk), PROT_READ | PROT_WRITE,
                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     b.chunks.resize(parts), b.heavy.resize(parts), b.len.assign(parts, 0);
-    std::vector<u32> at(parts);
+    std::vector<u32> place(parts);
     std::vector<Chunk *> cur(parts);
+    u32 *__restrict at = place.data(), *__restrict len = b.len.data();
     for (const char *q = cut(t), *end = cut(t + 1); q < end;) {
       u32 u = num(q), v = num(q), w = num(q), k = u >> PB;
       if (u == v)
         continue; // a self-loop never shortens a path
-      if (b.len[k]++ % CR == 0)
+      if (len[k]++ % CR == 0)
         b.chunks[k].push_back(cur[k] = next[k * G / parts]++), at[k] = 0;
       if (w >= WM)
         b.heavy[k].push_back(w), w = WM;
@@ -290,13 +291,15 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
     Region &r = reg[t];
     r.ord.reserve(n / NT + n / NT / 4), r.deg.reserve(r.ord.capacity());
     r.out = buf<u32>(g.off[n]);
+    // Locals, so the stores into out cannot alias them.
+    u32 *__restrict out = r.out.get(), j = 0;
+    const u32 *__restrict off = g.off.get(), *__restrict adj = g.adj.get();
     std::vector<u32> seeds;
     struct Walk {
       u32 slot, root, prev, at, steps;
       u64 w;
     };
     std::vector<Walk> walks;
-    u32 &j = r.m;
     for (u32 scan = share(n, t);;) {
       u32 seed = ~0u;
       for (; seed == ~0u && !seeds.empty(); seeds.pop_back())
@@ -306,36 +309,36 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
         if (!skip(scan) && claim(scan))
           seed = scan;
       if (seed == ~0u)
-        return;
+        return void(r.m = j);
       size_t blob = r.ord.size();
       auto visit = [&](u32 v) {
         if (r.ord.size() - blob < BLOB) {
           if (claim(v))
-            r.ord.push_back(v), __builtin_prefetch(&g.off[v]);
+            r.ord.push_back(v), __builtin_prefetch(&off[v]);
         } else if (!(taken[v >> 6] >> (v & 63) & 1))
           seeds.push_back(v);
       };
       auto put = [&](u32 slot, u32 v, u64 w) {
         if (w >= WM)
           r.esc.push_back({slot, w});
-        r.out[slot] = v | u32(std::min<u64>(w, WM)) << HB;
+        out[slot] = v | u32(std::min<u64>(w, WM)) << HB;
       };
       r.ord.push_back(seed);
       for (size_t lo = blob, hi; lo < r.ord.size(); lo = hi) {
         hi = std::min(r.ord.size(), lo + BATCH);
         for (size_t i = lo; i < hi; ++i) {
           if (i + BATCH < r.ord.size())
-            __builtin_prefetch(&g.adj[g.off[r.ord[i + BATCH]]]);
+            __builtin_prefetch(&adj[off[r.ord[i + BATCH]]]);
           u32 from = j;
-          if (j + g.off[r.ord[i] + 1] - g.off[r.ord[i]] > g.off[n])
+          if (j + off[r.ord[i] + 1] - off[r.ord[i]] > off[n])
             return void(full = true); // copies overran the edge buffer
-          for (u32 u = r.ord[i], e = g.off[u]; e < g.off[u + 1]; ++e) {
-            u32 x = g.adj[e], v = x & HM;
+          for (u32 u = r.ord[i], e = off[u]; e < off[u + 1]; ++e) {
+            u32 x = adj[e], v = x & HM;
             if (v == u)
               continue;
             if (skip(v)) // walked below; its slot is filled when it ends
               walks.push_back({j++, u, u, v, 0, weight(x, e, g.esc)}),
-                  __builtin_prefetch(&g.off[v]);
+                  __builtin_prefetch(&off[v]);
             else
               put(j++, v, weight(x, e, g.esc)), visit(v);
           }
@@ -349,13 +352,13 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
         while (!walks.empty()) {
           size_t kept = 0;
           for (Walk &k : walks) // the offsets were fetched last round
-            __builtin_prefetch(&g.adj[g.off[k.at]]);
+            __builtin_prefetch(&adj[off[k.at]]);
           for (Walk k : walks) {
             u32 ahead = 0, next = 0, end = ~0u;
             u64 nw = 0;
-            for (u32 e = g.off[k.at]; e < g.off[k.at + 1]; ++e)
-              if (u32 h = g.adj[e] & HM; h != k.prev && h != k.at)
-                ++ahead, next = h, nw = weight(g.adj[e], e, g.esc);
+            for (u32 e = off[k.at]; e < off[k.at + 1]; ++e)
+              if (u32 h = adj[e] & HM; h != k.prev && h != k.at)
+                ++ahead, next = h, nw = weight(adj[e], e, g.esc);
             if (ahead > 1)
               end = k.at;
             else if (ahead == 0 || next == k.root)
@@ -364,7 +367,7 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
                      !skip(next) || ++k.steps == 64)
               end = next;
             if (end == ~0u)
-              __builtin_prefetch(&g.off[next]), walks[kept++] = k;
+              __builtin_prefetch(&off[next]), walks[kept++] = k;
             else if (put(k.slot, end, k.w); end != k.root)
               visit(end);
           }
@@ -400,18 +403,20 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
   par([&](unsigned t) {
     Region &r = reg[t];
     auto w = r.wide.begin();
-    u32 lo = vs[t], hi = vs[t + 1], m = es[t + 1] - es[t], *a = &f.adj[es[t]];
-    std::fill(&rv.off[lo], &rv.off[hi], 0);
+    u32 lo = vs[t], hi = vs[t + 1], m = es[t + 1] - es[t];
+    u32 *__restrict a = &f.adj[es[t]], *__restrict ro = rv.off.get();
+    const u32 *__restrict out = r.out.get(), *__restrict ids = id.get();
+    std::fill(&ro[lo], &ro[hi], 0);
     // Renames heads and counts the reverse degrees of this thread's slice.
     for (u32 u = lo, j = 0; u < hi; ++u) {
       f.off[u] = es[t] + j;
       for (u32 k = r.deg[u - lo] == 255 ? *w++ : r.deg[u - lo]; k--; ++j) {
         if (j + 32 < m)
-          __builtin_prefetch(&id[r.out[j + 32] & HM]);
-        u32 x = id[r.out[j] & HM] | (r.out[j] & ~HM), v = x & HM;
+          __builtin_prefetch(&ids[out[j + 32] & HM]);
+        u32 x = ids[out[j] & HM] | (out[j] & ~HM), v = x & HM;
         a[j] = x;
         if (v - lo < hi - lo)
-          ++rv.off[v];
+          ++ro[v];
         else
           box[t][std::upper_bound(vs.begin(), vs.end(), v) - vs.begin() - 1]
               .push_back({v, u | (x & ~HM), es[t] + j});
@@ -514,12 +519,15 @@ struct Side {
   size_t drain(const Side &o, u64 &best) {
     u32 i = cur & (NB - 1);
     size_t done = 0;
+    // Locals, so the label and queue stores cannot alias them.
+    const u32 *__restrict off = g.off.get(), *__restrict adj = g.adj.get();
+    u64 bst = best;
     for (u32 x = head[i]; x != ~0u; x = blk[x].next)
       for (u32 k = 0; k < blk[x].n; ++k) {
         const u32 *b = blk[x].v;
         if (k + 8 < blk[x].n)
-          __builtin_prefetch(&g.off[b[k + 8]]),
-              __builtin_prefetch(&g.adj[g.off[b[k + 4]]]),
+          __builtin_prefetch(&off[b[k + 8]]),
+              __builtin_prefetch(&adj[off[b[k + 4]]]),
               __builtin_prefetch(&get(b[k + 4]));
         u32 u = b[k];
         u64 d = get(u);
@@ -527,13 +535,14 @@ struct Side {
         if (d >> SH != cur)
           continue; // stale: u has since moved to an earlier bucket
         ++done;
-        for (u32 e = g.off[u]; e < g.off[u + 1]; ++e) {
-          u32 y = g.adj[e], v = y & HM;
+        for (u32 e = off[u], end = off[u + 1]; e < end; ++e) {
+          u32 y = adj[e], v = y & HM;
           u64 nd = d + weight(y, e, g.esc), &dv = at(v), old = dv;
           dv = std::min(nd, old), push(nd, v, nd < old);
-          best = std::min(best, nd + o.get(v));
+          bst = std::min(bst, nd + o.get(v));
         }
       }
+    best = bst;
     blk[tail[i]].next = free, free = head[i], head[i] = tail[i] = ~0u;
     return done;
   }

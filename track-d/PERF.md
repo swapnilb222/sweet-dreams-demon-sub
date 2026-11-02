@@ -12,7 +12,8 @@ Every step from the reference to the current version. Each step lists the live-b
 | 5 | Chain contraction folded into the renumbering pass | 6bbd254 | run-caef9c2ebef7 | **0.110** | **55.2** | **563** | **30.44** | **74.17** |
 | 6 | Correctness fix in renumbering, profile-guided static build, parallel teardown, fused reverse pass | 93ab427 | run-7e04fad34160 | 0.113 | 55.4 | 569 | 29.99 | 73.85 |
 | 7 | Step 6 without the parallel teardown; cheap racy claims again, with an exact fallback | 93a6c1c | run-b0e091cfc395 | 0.109 | 55.3 | 571 | 30.63 | 74.30 |
-| 8 | Prefetched chain walks, branch-free relaxation | pending | pending | | | | | |
+| 8 | Prefetched chain walks, branch-free relaxation | 240b78d | run-b11110b169c2 | **0.100** | **54.9** | **571** | **31.95** | **75.22** |
+| 9 | Hot loops rewritten so the compiler can keep their values in registers | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -92,6 +93,19 @@ We compared each phase against another implementation of the same design. Two of
 
 Locally, over 20 interleaved runs with the board's build, step 8 measured 85 / 87 / 93 ms (minimum / first quartile / median), against 94 / 97 / 101 ms for step 7. It is 2 lines longer.
 
+*Board result: 0.100 s and 0.102 s, first place.*
+
+### Step 9: let the compiler keep values in registers
+A sampling profile showed no single hot spot, so we read the compiled loops instead. In C++, writing through one `u32` pointer may change any other `u32` in memory, unless the compiler can prove otherwise. Our hot loops store `u32` values (copied edges, queue entries) while reading `u32` arrays (row offsets, edges), and some of their counters also live in memory. So after every store, the compiler had to reload the row offsets, the end of the row, the edge counter, and even the pointers to the arrays.
+
+The fix changes nothing about the algorithm. The loops now copy those pointers and counters into local variables, and mark the pointers `__restrict` (a promise that they do not overlap). Then the compiler can keep everything in registers. This touched four loops:
+
+- **Renumbering** (BFS and chain walks): its edge counter was a reference to a field of the thread's region, so every edge copied meant a load and a store of it. The phase dropped from about 29 to 22–25 ms.
+- **The search's bucket drain:** the end of each row and the best meeting distance were reloaded after every label and queue write. The query phase dropped from about 25 to 22–23 ms.
+- **The rename pass and the parser:** smaller gains, about 0.5 ms each.
+
+Locally, over 20 interleaved runs with the board's build, step 9 measured 81 / 84 / 88 ms (minimum / first quartile / median), against 86 / 90 / 93 ms for step 8. It is 7 lines longer.
+
 ---
 
 ## Things we tried that did not help
@@ -107,6 +121,9 @@ Each idea was measured against the version before it and dropped when it did not
 - **Releasing memory one page at a time.** Each release costs a little, and thousands of them added about 8 ms.
 - **Training the profile on a full-size input.** No better than the small sample, and it makes the build two minutes slower.
 - **An atomic operation on every claim attempt.** Correct, but 4 to 10 ms slower than reading first.
+- **Huge pages (2 MiB) for the final graph.** The query phase got about 10% faster, because the searches miss the TLB less. But creating the huge pages either cost 4 to 5 ms elsewhere or, when created early, raised the memory peak by 3 to 7 MB. On our virtual machine each new huge page also triggers faults on the host, so we could not measure the real cost.
+- **Prefaulting the input file's pages in one call per thread.** The kernel already maps the file 16 pages per fault, so this saved only about 1,400 faults.
+- **Restrict-qualified pointers in the build and reverse-fill loops.** No measurable change, so we left those loops as they were.
 - **A private claim bitmap per thread** during renumbering. It saves a little time, but adds 2.6 MB in that phase, which would become the new memory peak.
 - **A spinning barrier between phases** instead of the standard one, which sleeps. Much slower locally (median 127 ms against 101 ms), because a spinning thread takes execution slots from its busy hyperthread sibling.
 
