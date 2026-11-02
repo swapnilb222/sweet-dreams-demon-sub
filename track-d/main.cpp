@@ -444,13 +444,17 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
 
 // One search direction: a ring of distance buckets (far jumps wait in a heap)
 // and distances in pages materialized on first write, recycled per query.
-struct Side {
+// Labels of type L saturate at NONE: a label below NONE is a real path's
+// length, so with 32-bit labels any answer at or above NONE is rerun with
+// 64-bit ones.
+template <class L> struct Side {
+  static constexpr u64 NONE = std::min<u64>(INF, L(~L(0)));
   static constexpr unsigned SH = 6, NB = 1024, PS = 7, PG = 1u << PS, BS = 62;
   const Csr &g;
-  std::vector<u64 *> dir;
+  std::vector<L *> dir;
   std::vector<u32> used;
-  Buf<u64> pool;
-  u64 blank[PG];
+  Buf<L> pool;
+  L blank[PG];
   // Bucket entries live in blocks chained per bucket and recycled through a
   // free list, so memory follows the live queue, not each bucket's record.
   struct Blk {
@@ -462,18 +466,19 @@ struct Side {
   std::priority_queue<Far, std::vector<Far>, std::greater<>> far;
   u64 cur = 0;
   Side(const Csr &c, u32 n)
-      : g(c), dir((n >> PS) + 1), pool(buf<u64>(dir.size() * PG)) {
-    std::fill(blank, blank + PG, INF), std::fill(dir.begin(), dir.end(), +blank);
+      : g(c), dir((n >> PS) + 1), pool(buf<L>(dir.size() * PG)) {
+    std::fill(blank, blank + PG, NONE), std::fill(dir.begin(), dir.end(), +blank);
     clear();
   }
-  const u64 &get(u32 v) const { return dir[v >> PS][v & (PG - 1)]; }
-  u64 &at(u32 v) {
-    u64 *p = dir[v >> PS];
+  const L *lab(u32 v) const { return dir[v >> PS] + (v & (PG - 1)); }
+  u64 get(u32 v) const { return *lab(v); }
+  L &at(u32 v) {
+    L *p = dir[v >> PS];
     return (p == blank ? page(v) : p)[v & (PG - 1)];
   }
-  [[gnu::noinline]] u64 *page(u32 v) {
-    u64 *p = dir[v >> PS] = &pool[used.size() * PG];
-    return std::fill(p, p + PG, INF), used.push_back(v >> PS), p;
+  [[gnu::noinline]] L *page(u32 v) {
+    L *p = dir[v >> PS] = &pool[used.size() * PG];
+    return std::fill(p, p + PG, NONE), used.push_back(v >> PS), p;
   }
   // Writes the entry either way and counts it only when `take`, so a
   // relaxation needs no unpredictable branch.
@@ -498,8 +503,9 @@ struct Side {
   // An edge too heavy for the ring's reach from the current bucket.
   [[gnu::noinline]] u64 heavy(u64 d, u32 y, u32 e, const Side &o, u64 bst) {
     u32 v = y & HM;
-    u64 nd = d + weight(y, e, g.esc), &dv = at(v), old = dv;
-    dv = std::min(nd, old), push(nd, v, nd < old);
+    L &dv = at(v);
+    u64 nd = d + weight(y, e, g.esc), old = dv;
+    dv = L(std::min(nd, old)), push(nd, v, nd < old);
     return std::min(bst, nd + o.get(v));
   }
   void push(u64 d, u32 v, bool take = true) {
@@ -543,7 +549,7 @@ struct Side {
         if (k + 8 < blk[x].n)
           __builtin_prefetch(&off[b[k + 8]]),
               __builtin_prefetch(&adj[off[b[k + 4]]]),
-              __builtin_prefetch(&get(b[k + 4]));
+              __builtin_prefetch(lab(b[k + 4]));
         u32 u = b[k];
         u64 d = get(u);
         if (d >> SH != cur)
@@ -555,8 +561,9 @@ struct Side {
             bst = heavy(d, y, e, o, bst);
             continue;
           }
-          u64 nd = d + (y >> hb), &dv = at(v), old = dv;
-          dv = std::min(nd, old), put((nd >> SH) & (NB - 1), v, nd < old);
+          L &dv = at(v);
+          u64 nd = d + (y >> hb), old = dv;
+          dv = L(std::min(nd, old)), put((nd >> SH) & (NB - 1), v, nd < old);
           bst = std::min(bst, nd + o.get(v));
         }
       }
@@ -568,22 +575,23 @@ struct Side {
 
 // Forward alone for short queries, then bidirectional, growing the side that
 // has settled less; stops once the two lower bounds reach the best meeting.
-struct Solver {
+// Returns the distance, or NONE or more if there is no path below NONE.
+template <class L> struct Solver {
   static constexpr size_t PROBE = 256;
   const Csr &F, &R;
-  Side f, b;
+  Side<L> f, b;
   Solver(const Csr &fw, const Csr &rv, u32 n)
       : F(fw), R(rv), f(fw, n), b(rv, n) {}
-  int64_t solve(u32 s, u32 t) {
+  u64 solve(u32 s, u32 t) {
     if (s == t || F.off[s] == F.off[s + 1] || R.off[t] == R.off[t + 1])
-      return s == t ? 0 : -1; // the same node, or no way out of s or into t
-    b.clear(), f.start(s); // b not started yet: every backward label is INF
+      return s == t ? 0 : INF; // the same node, or no way out of s or into t
+    b.clear(), f.start(s); // b not started yet: every backward label is NONE
     u64 best = INF;
     size_t fs = 0, bs = 0;
     while (fs < PROBE) {
       u64 lf = f.lower(), dt = f.get(t);
       if (dt <= lf || lf == INF)
-        return dt >= INF ? -1 : int64_t(dt);
+        return dt;
       fs += f.drain(b, best);
     }
     b.start(t), best = f.get(t);
@@ -596,7 +604,7 @@ struct Solver {
       else
         bs += b.drain(f, best);
     }
-    return best >= INF ? -1 : int64_t(best);
+    return best;
   }
 };
 
@@ -628,9 +636,17 @@ int main(int argc, char **argv) {
   std::atomic<size_t> next{0};
   par([&](unsigned) {
     // Never freed: unmapping while other threads search would stall them.
-    Solver &solver = *new Solver(fwd, rev, n);
-    for (size_t k; (k = next++) < qs.size();)
-      ans[order[k]] = solver.solve(qs[order[k]].first, qs[order[k]].second);
+    // Both made before any search: allocating during the phase would stall
+    // the other threads' page faults.
+    auto &narrow = *new Solver<u32>(fwd, rev, n);
+    auto &wide = *new Solver<u64>(fwd, rev, n);
+    for (size_t k; (k = next++) < qs.size();) {
+      auto [s, t] = qs[order[k]];
+      u64 d = narrow.solve(s, t);
+      if (d >= Side<u32>::NONE)
+        d = wide.solve(s, t);
+      ans[order[k]] = d >= INF ? -1 : int64_t(d);
+    }
   });
   FILE *file = fopen((out + "/distances.txt").c_str(), "wb");
   if (!file)
