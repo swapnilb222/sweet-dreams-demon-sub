@@ -218,7 +218,7 @@ Three changes, each with the same answers and the same memory accesses:
 
 Together they cut the whole program's instructions by 7.8%, from 2.90 to 2.67 billion, with the simulated cache misses unchanged. On the laptop the change was even, as expected when turbo makes instructions cheap. On the board, with Track A at its normal time, it ran 0.0849 s, our best yet.
 
-Two follow-ups did not help. Copying the size globals into locals in the parser and the row builder saved only 0.1%, because the compiler had already kept them in registers. Storing both directions' labels side by side in shared pages, so that a relaxation reads the other side's label from the line it writes, cost 4% more instructions and 8% more L1 misses. The pages became twice as large, and filling them cost more than the shared line saved. Also, a missing output directory now ends with exit code 1 instead of a crash on the way out.
+Three follow-ups did not help. Copying the size globals into locals in the parser and the row builder saved only 0.1%, because the compiler had already kept them in registers. Storing both directions' labels side by side in shared pages, so that a relaxation reads the other side's label from the line it writes, cost 4% more instructions and 8% more L1 misses. The pages became twice as large, and filling them cost more than the shared line saved. A third follow-up gave each bucket a raw write pointer into 256-byte-aligned blocks, so that a push needs no block count. It was correct on every test but within 0.6% of step 28's instruction count, because the compiler had already made the old push nearly as cheap, so we left it out. Also, a missing output directory now ends with exit code 1 instead of a crash on the way out.
 
 ## How we measured
 
