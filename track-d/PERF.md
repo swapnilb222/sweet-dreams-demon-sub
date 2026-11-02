@@ -21,7 +21,8 @@ Every step from the reference to the current version. Each step lists the live-b
 | 14 | Board test: the reverse graph in 2 MiB pages | 99aef00 | run-719b42059767 | 0.089 | 57.4 | 622 | 33.15 | 76.03 |
 | 15 | Step 11 again: step 14 reverted | f09ad57 | run-4590a0e90760 | **0.087** | **58.0** | **600** | **33.63** | **76.34** |
 | 16 | Board test: a barrier that spins briefly before sleeping | 67069f8 | run-8755815cfc16 | 0.087 | 58.1 | 610 | 33.57 | 76.27 |
-| 17 | Step 11 again: step 16 reverted | pending | pending | | | | | |
+| 17 | Step 11 again: step 16 reverted | 89b85fd | not run separately | | | | | |
+| 18 | The same program in 11 fewer lines | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -167,6 +168,16 @@ The new barrier spins for about 2,000 `pause` instructions (tens of microseconds
 Locally it is level with step 11 over 30 interleaved runs, but our virtual machine does not show the host's sleep states, so only the board can tell. It is 10 lines longer. If both board runs are no faster than step 11, we revert it.
 
 *Board result: 0.0870 s (run-8755815cfc16) and 0.0907 s (run-6b2fd972effa). Step 11's code ran just before it, as step 15, at 0.0870 s (run-4590a0e90760) and 0.0877 s (run-851c8ae1bb48). So the barrier did not help, and step 17 reverts it. The step 15 runs also show how much the board drifts: the same code measured 0.0893 s and 0.0909 s an hour and a half earlier.*
+
+### Step 18: the same program in fewer lines
+Line count is the one part of the score that does not vary from run to run, so we went through the code for statements that could be written more simply without changing what runs:
+
+- The escape tables are sorted with a plain sort. Each slot appears once, so the stable sort and its custom comparison were not needed.
+- The file mapping no longer skips the second `mmap` for an empty file, because that call simply fails on its own.
+- The exact rerun of the renumbering resets its state with one assignment each, instead of loops.
+- A few short setup statements share a line, and the output checks for a failed write once, when the file is closed.
+
+Instruction counts on the sample input confirm the program does the same work (310.3 million instructions, against 311.0 million before). All tests pass, and it is 11 lines shorter: 582 locally.
 
 ---
 

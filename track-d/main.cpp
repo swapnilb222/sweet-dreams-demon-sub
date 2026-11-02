@@ -61,12 +61,11 @@ static u64 weight(u32 x, u32 slot, const Esc &esc) {
                  : std::lower_bound(esc.begin(), esc.end(), std::pair{slot, u64(0)})
                        ->second;
 }
-// Sorted by slot; for a slot listed twice, lookups find the earlier part's.
+// Sorted by slot, for the lookups; each slot is listed once.
 static void merge(Esc &into, std::vector<Esc> &parts) {
   for (auto &e : parts)
     into.insert(into.end(), e.begin(), e.end());
-  std::stable_sort(into.begin(), into.end(),
-                   [](auto &a, auto &b) { return a.first < b.first; });
+  std::sort(into.begin(), into.end());
 }
 struct Csr {
   Buf<u32> off, adj;
@@ -102,10 +101,8 @@ static const char *map(const std::string &path, size_t &len) {
   len = size_t(st.st_size);
   auto *p = static_cast<char *>(mmap(nullptr, len + 4096, PROT_READ,
                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-  if (len)
-    mmap(p, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
-  close(fd);
-  return p;
+  mmap(p, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0); // fails if empty
+  return close(fd), p;
 }
 // Digits have bit 0x10 set and separators do not, so one load finds the end
 // of a number of up to 7 digits and its digits combine in pairs, quads, halves.
@@ -152,10 +149,8 @@ static Csr read_graph(const std::string &path, u32 &n,
                       std::vector<u64> &bypass) {
   size_t size;
   const char *text = map(path, size), *p = text;
-  n = num(p);
-  num(p);
-  HB = std::bit_width(n + 1);
-  HM = (1u << HB) - 1, WM = ~0u >> HB;
+  n = num(p), num(p); // the edge count is not needed
+  HB = std::bit_width(n + 1), HM = (1u << HB) - 1, WM = ~0u >> HB;
   const u32 PB = 14, PM = (1u << PB) - 1, parts = (n - 1) / (PM + 1) + 1;
   auto cut = [&](unsigned t) { // thread t's first line
     const char *q = p + size_t(text + size - p) * t / NT;
@@ -256,8 +251,7 @@ static void reverse(const Csr &f, Csr &r, const std::vector<u32> &cut,
     for (u32 v = cut[t]; v < cut[t + 1]; ++v)
       tot[t + 1] += r.off[v];
   });
-  for (unsigned t = 0; t < NT; ++t)
-    tot[t + 1] += tot[t];
+  std::partial_sum(tot.begin(), tot.end(), tot.begin());
   std::vector<Esc> esc(NT);
   par([&](unsigned t) {
     u32 lo = cut[t], hi = cut[t + 1];
@@ -407,10 +401,7 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
            es[t + 1] = es[t] + reg[t].m;
   if (vs[NT] <= n && es[NT] <= g.m && !full)
     break;
-  for (auto &w : taken)
-    w = 0;
-  for (auto &r : reg)
-    r = {};
+  taken = std::vector<std::atomic<u64>>(taken.size()), reg = std::vector<Region>(NT);
   }
   // The raw rows are done with. Their pages, already faulted in, become the
   // id map and the forward graph, which fit as the counts did not grow. The
@@ -487,8 +478,7 @@ struct Side {
   size_t near = 0;
   Side(const Csr &c, u32 n)
       : g(c), dir((n >> PS) + 1), pool(buf<u64>(dir.size() * PG)) {
-    std::fill(blank, blank + PG, INF);
-    std::fill(dir.begin(), dir.end(), +blank);
+    std::fill(blank, blank + PG, INF), std::fill(dir.begin(), dir.end(), +blank);
     clear();
   }
   const u64 &get(u32 v) const { return dir[v >> PS][v & (PG - 1)]; }
@@ -591,8 +581,7 @@ struct Solver {
       return 0;
     if (F.off[s] == F.off[s + 1] || R.off[t] == R.off[t + 1])
       return -1;
-    b.clear(); // not started yet: every backward label is INF
-    f.start(s);
+    b.clear(), f.start(s); // b not started yet: every backward label is INF
     u64 best = INF;
     size_t fs = 0, bs = 0;
     while (fs < PROBE) {
@@ -601,8 +590,7 @@ struct Solver {
         return dt >= INF ? -1 : int64_t(dt);
       fs += f.drain(b, best);
     }
-    b.start(t);
-    best = f.get(t);
+    b.start(t), best = f.get(t);
     for (;;) {
       u64 lf = f.lower(), lb = b.lower();
       if (lf == INF || lb == INF || lf + lb >= best)
@@ -651,10 +639,9 @@ int main(int argc, char **argv) {
       ans[order[k]] = solver.solve(qs[order[k]].first, qs[order[k]].second);
   });
   FILE *file = fopen((out + "/distances.txt").c_str(), "wb");
-  for (int64_t a : ans)
-    if (!file || fprintf(file, "%lld\n", (long long)a) < 0)
-      return 1;
-  if (fclose(file))
+  if (!file)
     return 1;
-  _exit(0);
+  for (int64_t a : ans)
+    fprintf(file, "%lld\n", (long long)a);
+  _exit(fclose(file) != 0); // a failed write shows here
 }
