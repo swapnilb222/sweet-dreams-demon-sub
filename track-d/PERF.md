@@ -23,7 +23,8 @@ Every step from the reference to the current version. Each step lists the live-b
 | 16 | Board test: a barrier that spins briefly before sleeping | 67069f8 | run-8755815cfc16 | 0.087 | 58.1 | 610 | 33.57 | 76.27 |
 | 17 | Step 11 again: step 16 reverted | 89b85fd | run-98427ea1df21 | 0.089 | 58.8 | 600 | 33.31 | 76.09 |
 | 18 | The same program in 11 fewer lines | 53bbed8 | run-c9f3114356b5 | 0.089 | 58.2 | 589 | 33.48 | 76.19 |
-| 19 | Board test: fewer instructions in the search and the parser | pending | pending | | | | | |
+| 19 | Board test: fewer instructions in the search and the parser | 30bba3d | run-af7a78fbfbdb | 0.094 | 56.1 | 596 | 32.61 | 75.62 |
+| 20 | Step 18 again: step 19 reverted | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -190,6 +191,8 @@ Valgrind's instruction counts show the search's bucket drain running about half 
 - **Simpler parser bookkeeping.** The parser no longer counts each part's edges with a division by the chunk size per edge. The counts follow from the chunks at the end.
 
 The query phase got about 1.5 ms faster in the per-phase timings, but our laptop's full timings were level. Its cores and clock differ from the scoring machine's, so the board decides. It is 7 lines longer. We keep it only if both board runs beat step 18's.
+
+*Board result: 0.0944 s (run-af7a78fbfbdb) and 0.1077 s (run-8fe3dcef2fc3), both slower than step 18. But the machine was noisy during these runs: our Track A code, unchanged in this push, ran 1.24 and 1.38 times slower than its own best in the same two runs. So this result cannot tell whether the change is slower. Step 20 goes back to step 18, the known-good version. Track A, whose code never changes between our pushes, works as a control from now on.*
 
 ---
 

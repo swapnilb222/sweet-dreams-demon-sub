@@ -168,21 +168,19 @@ static Csr read_graph(const std::string &path, u32 &n,
           mmap(nullptr, b.cap * sizeof(Chunk), PROT_READ | PROT_WRITE,
                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     b.chunks.resize(parts), b.heavy.resize(parts), b.len.assign(parts, 0);
-    std::vector<u32> place(parts, CR); // fill of the part's last chunk
+    std::vector<u32> place(parts);
     std::vector<Chunk *> cur(parts);
-    u32 *__restrict at = place.data();
+    u32 *__restrict at = place.data(), *__restrict len = b.len.data();
     for (const char *q = cut(t), *end = cut(t + 1); q < end;) {
       u32 u = num(q), v = num(q), w = num(q), k = u >> PB;
       if (u == v)
         continue; // a self-loop never shortens a path
-      if (at[k] == CR)
+      if (len[k]++ % CR == 0)
         b.chunks[k].push_back(cur[k] = next[k * G / parts]++), at[k] = 0;
       if (w >= WM)
         b.heavy[k].push_back(w), w = WM;
       cur[k]->x[at[k]] = v | w << HB, cur[k]->lo[at[k]++] = uint16_t(u & PM);
     }
-    for (u32 k = 0; k < parts; ++k)
-      b.len[k] = b.chunks[k].empty() ? 0 : u32(b.chunks[k].size() - 1) * CR + at[k];
   });
   Csr g;
   for (auto &b : bins)
@@ -477,6 +475,7 @@ struct Side {
                       std::greater<>>
       far;
   u64 cur = 0;
+  size_t near = 0;
   Side(const Csr &c, u32 n)
       : g(c), dir((n >> PS) + 1), pool(buf<u64>(dir.size() * PG)) {
     std::fill(blank, blank + PG, INF), std::fill(dir.begin(), dir.end(), +blank);
@@ -484,66 +483,60 @@ struct Side {
   }
   const u64 &get(u32 v) const { return dir[v >> PS][v & (PG - 1)]; }
   u64 &at(u32 v) {
-    u64 *p = dir[v >> PS];
-    return (p == blank ? page(v) : p)[v & (PG - 1)];
-  }
-  [[gnu::noinline]] u64 *page(u32 v) {
-    u64 *p = dir[v >> PS] = &pool[used.size() * PG];
-    std::fill(p, p + PG, INF);
-    used.push_back(v >> PS);
-    return p;
+    u64 *&p = dir[v >> PS];
+    if (p == blank) {
+      p = &pool[used.size() * PG];
+      std::fill(p, p + PG, INF);
+      used.push_back(v >> PS);
+    }
+    return p[v & (PG - 1)];
   }
   // Writes the entry either way and counts it only when `take`, so a
   // relaxation needs no unpredictable branch.
   void put(u32 i, u32 v, bool take = true) {
     u32 t = tail[i];
-    if (t == ~0u || blk[t].n == BS) [[unlikely]]
-      t = grow(i);
-    blk[t].v[blk[t].n] = v, blk[t].n += take;
+    if (t == ~0u || blk[t].n == BS) {
+      u32 b = free;
+      if (b != ~0u)
+        free = blk[b].next;
+      else
+        b = u32(blk.size()), blk.emplace_back();
+      blk[b].next = ~0u, blk[b].n = 0;
+      (t == ~0u ? head[i] : blk[t].next) = b;
+      tail[i] = t = b;
+    }
+    blk[t].v[blk[t].n] = v, blk[t].n += take, near += take;
   }
-  // The rare paths stay out of line, so the hot loop keeps its registers.
-  [[gnu::noinline]] u32 grow(u32 i) {
-    u32 b = free, t = tail[i];
-    if (b != ~0u)
-      free = blk[b].next;
-    else
-      b = u32(blk.size()), blk.emplace_back();
-    blk[b].next = ~0u, blk[b].n = 0;
-    (t == ~0u ? head[i] : blk[t].next) = b;
-    return tail[i] = b;
-  }
-  [[gnu::noinline]] void jump(u64 d, u32 v) { far.push({d, v}); }
   void push(u64 d, u32 v, bool take = true) {
     if ((d >> SH) - cur < NB)
       put((d >> SH) & (NB - 1), v, take);
     else if (take)
-      jump(d, v);
+      far.push({d, v});
   }
   void clear() {
     for (u32 pg : used)
       dir[pg] = blank;
     used.clear(), blk.clear();
     std::fill(head, head + NB, ~0u), std::fill(tail, tail + NB, ~0u);
-    free = ~0u, far = {}, cur = 0;
+    free = ~0u, far = {}, cur = near = 0;
   }
   void start(u32 s) { clear(), at(s) = 0, push(0, s); }
   // Moves to the first nonempty bucket; returns its smallest possible key.
   u64 lower() {
-    u64 fb = far.empty() ? ~u64(0) : far.top().first >> SH, end = std::min(fb, cur + NB);
-    while (cur < end && head[cur & (NB - 1)] == ~0u)
-      ++cur;
-    if (cur == end) { // nothing in the ring before the far heap's first entry
-      if (far.empty())
-        return INF;
+    u64 fb = far.empty() ? ~u64(0) : far.top().first >> SH;
+    if (!near && far.empty())
+      return INF;
+    if (!near)
       cur = fb;
-    }
+    while (cur < fb && head[cur & (NB - 1)] == ~0u)
+      ++cur;
     for (; !far.empty() && (far.top().first >> SH) < cur + NB; far.pop())
       put((far.top().first >> SH) & (NB - 1), far.top().second);
     return cur << SH;
   }
   // Settles the current bucket (label-correcting inside it); returns the count.
   // Entries pushed into it meanwhile land in its last block and are seen too.
-  [[gnu::noinline]] size_t drain(const Side &o, u64 &best) {
+  size_t drain(const Side &o, u64 &best) {
     u32 i = cur & (NB - 1);
     size_t done = 0;
     // Locals, so the label and queue stores cannot alias them.
@@ -558,6 +551,7 @@ struct Side {
               __builtin_prefetch(&get(b[k + 4]));
         u32 u = b[k];
         u64 d = get(u);
+        --near;
         if (d >> SH != cur)
           continue; // stale: u has since moved to an earlier bucket
         ++done;
