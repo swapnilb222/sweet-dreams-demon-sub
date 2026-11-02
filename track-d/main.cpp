@@ -10,22 +10,14 @@
 #include <algorithm>
 #include <atomic>
 #include <barrier>
-#include <bit>
-#include <cstdio>
-#include <cstdint>
 #include <fcntl.h>
 #include <functional>
 #include <malloc.h>
-#include <memory>
 #include <numeric>
 #include <queue>
-#include <string>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
-#include <thread>
-#include <unistd.h>
-#include <vector>
 
 using u32 = uint32_t;
 using u64 = uint64_t;
