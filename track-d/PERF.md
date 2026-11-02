@@ -15,7 +15,8 @@ Every step from the reference to the current version. Each step lists the live-b
 | 8 | Prefetched chain walks, branch-free relaxation | 240b78d | run-b11110b169c2 | 0.100 | 54.9 | 571 | 31.95 | 75.22 |
 | 9 | Hot loops rewritten so the compiler can keep their values in registers | d88f3f8 | run-460785953528 | 0.096 | 57.3 | 578 | 32.25 | 75.43 |
 | 10 | Raw graph stored as four fixed slots per node | 65cc5ce | run-4efb9302d30e | **0.089** | **57.8** | **593** | **33.25** | **76.09** |
-| 11 | The raw graph's pages reused for the id map and forward offsets | pending | pending | | | | | |
+| 11 | The raw graph's pages reused for the id map and forward offsets | 5491bc8 | run-940c564ae383 | 0.089 | 59.0 | 600 | 33.08 | 75.98 |
+| 12 | The input file unmapped by the parsing threads, not at exit | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -132,6 +133,13 @@ The new placement can only fit if the new graph is no larger than the raw one. T
 
 The rename phase dropped from about 10.7 to 8.6 ms, and memory is unchanged. Locally, over 20 interleaved runs with the board's build, step 11 measured 80 / 90 / 93 ms (minimum / first quartile / median), against 86 / 94 / 97 ms for step 10, on a slower stretch of the machine. It is 7 lines longer.
 
+*Board result: 0.0893 s (run-940c564ae383) and 0.0909 s (run-2bf1b13d4cae), against 0.0894 s and 0.0964 s for step 10. Both runs were fast this time, so the average improved by about 3%, but the best run did not, and the board shows each team's best run. Memory read 58 to 59 MB, while our local peak stays at about 56 MB. The memory controller charges pages to a process in per-CPU batches, so when many threads fault at once the measured peak can read a few MB high. We cannot control that from the program.*
+
+### Step 12: unmap the input file in parallel
+The program's own phase timers cover about 5 ms less than the board's clock, which also includes process start-up and exit. Exiting has to tear down every mapping. That includes the 92 MB input file, whose 23,000 mapped pages each need their page-cache reference released, on one thread, while the clock runs.
+
+Now each parsing thread unmaps its own slice of the file as soon as it has parsed it, so the work is done in parallel and early. The file stays in the page cache. Measured as the time from the end of `main`'s work to process exit, over 20 interleaved runs, this cut the median from 4.8 to 3.9 ms. Over 30 interleaved runs with the board's build, step 12 measured 74 / 82 / 94 ms (minimum / first quartile / median), against 77 / 84 / 96 ms for step 11. It is 1 line longer.
+
 ---
 
 ## Things we tried that did not help
@@ -154,6 +162,12 @@ Each idea was measured against the version before it and dropped when it did not
 - **Letting threads take seeds from each other's id range.** Region sizes stayed just as uneven, which showed that they reflect thread speed (two threads share each core), not idle threads.
 - **16-bit search labels.** Another implementation uses them. In our tests its query phase was slower than ours.
 - **Profile training on a full-size input, and tuning for the scoring CPU's core type** (`-mtune=alderlake`, same instruction set). Neither was measurably faster than the plain sample-trained build.
+- **Freeing the graphs and search state in parallel before exit.** The time to exit dropped by about 1 ms in the median, but not in the first quartile. Step 6 tried the same and the board ran it slower, so we left it out.
+- **Moving the edge copies' pages into the reverse graph with `mremap`,** instead of freeing them and faulting in new ones. It saved 4,000 page faults, but the copies then had to live until the whole rename pass ended, and the peak rose by 4 MB.
+- **Releasing the input bins in parallel** (each thread its own, with `MADV_DONTNEED`) instead of unmapping them serially (about 2 ms between the build passes). It was no faster: the kernel's page freeing contends about as much as the serial unmap costs.
+- **One byte per node for claims** instead of one bit, so threads share fewer cache lines. No gain, and 1 MB more memory.
+- **Deeper prefetching, or clamped look-ahead, in the search.** No gain. The search is limited by its own instructions, not by waiting on memory.
+- **Other bucket widths (32, 128) and probe lengths (128, 512).** All within noise of the current 64 and 256.
 - **A private claim bitmap per thread** during renumbering. It saves a little time, but adds 2.6 MB in that phase, which would become the new memory peak.
 - **A spinning barrier between phases** instead of the standard one, which sleeps. Much slower locally (median 127 ms against 101 ms), because a spinning thread takes execution slots from its busy hyperthread sibling.
 
