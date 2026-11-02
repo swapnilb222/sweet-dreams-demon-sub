@@ -16,7 +16,8 @@ Every step from the reference to the current version. Each step lists the live-b
 | 9 | Hot loops rewritten so the compiler can keep their values in registers | d88f3f8 | run-460785953528 | 0.096 | 57.3 | 578 | 32.25 | 75.43 |
 | 10 | Raw graph stored as four fixed slots per node | 65cc5ce | run-4efb9302d30e | **0.089** | **57.8** | **593** | **33.25** | **76.09** |
 | 11 | The raw graph's pages reused for the id map and forward offsets | 5491bc8 | run-940c564ae383 | 0.089 | 59.0 | 600 | 33.08 | 75.98 |
-| 12 | The input file unmapped by the parsing threads, not at exit | pending | pending | | | | | |
+| 12 | The input file unmapped by the parsing threads, not at exit | 6c0a85d | run-225c1dc47a94 | 0.095 | 56.0 | 601 | 32.31 | 75.57 |
+| 13 | Step 11 again: step 12 reverted | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -140,6 +141,11 @@ The program's own phase timers cover about 5 ms less than the board's clock, whi
 
 Now each parsing thread unmaps its own slice of the file as soon as it has parsed it, so the work is done in parallel and early. The file stays in the page cache. Measured as the time from the end of `main`'s work to process exit, over 20 interleaved runs, this cut the median from 4.8 to 3.9 ms. Over 30 interleaved runs with the board's build, step 12 measured 74 / 82 / 94 ms (minimum / first quartile / median), against 77 / 84 / 96 ms for step 11. It is 1 line longer.
 
+*Board result: 0.095 s and 0.108 s, slower than step 11 in both runs. Other teams' runs were also slower than their best at that time, so part of this was the board. But unmapping during the parse makes every thread interrupt all the others to flush their address caches while they are still parsing. On real hardware that can cost more than our virtual machine shows, and step 6, which did the same, was also slow on the board. Step 13 reverts it.*
+
+### Step 13: back to step 11
+The code is exactly that of step 11, the version with the best board average so far (0.0893 s and 0.0909 s).
+
 ---
 
 ## Things we tried that did not help
@@ -168,6 +174,8 @@ Each idea was measured against the version before it and dropped when it did not
 - **One byte per node for claims** instead of one bit, so threads share fewer cache lines. No gain, and 1 MB more memory.
 - **Deeper prefetching, or clamped look-ahead, in the search.** No gain. The search is limited by its own instructions, not by waiting on memory.
 - **Other bucket widths (32, 128) and probe lengths (128, 512).** All within noise of the current 64 and 256.
+- **Copying the edge-field width and masks into locals in the hot loops,** the way step 9 did for pointers. The compiler was already keeping them in registers: the disassembly has the same number of loads.
+- **Larger chain-walk batches (16, 32) and other BFS region sizes (256, 1024).** The renumbering got up to 2 ms faster with bigger batches, but the total was no better over 20 interleaved runs with the board's build.
 - **A private claim bitmap per thread** during renumbering. It saves a little time, but adds 2.6 MB in that phase, which would become the new memory peak.
 - **A spinning barrier between phases** instead of the standard one, which sleeps. Much slower locally (median 127 ms against 101 ms), because a spinning thread takes execution slots from its busy hyperthread sibling.
 

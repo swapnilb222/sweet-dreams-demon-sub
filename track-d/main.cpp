@@ -186,9 +186,6 @@ static Csr read_graph(const std::string &path, u32 &n,
         b.heavy[k].push_back(w), w = WM;
       cur[k]->x[at[k]] = v | w << HB, cur[k]->lo[at[k]++] = uint16_t(u & PM);
     }
-    // Unmaps its slice of the file now, in parallel, rather than at exit on
-    // one thread. The pages stay in the page cache.
-    drop(const_cast<char *>(cut(t)), const_cast<char *>(cut(t + 1)));
   });
   Csr g;
   for (auto &b : bins)
