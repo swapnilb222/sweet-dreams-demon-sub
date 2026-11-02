@@ -19,7 +19,8 @@ Every step from the reference to the current version. Each step lists the live-b
 | 12 | The input file unmapped by the parsing threads, not at exit | 6c0a85d | run-225c1dc47a94 | 0.095 | 56.0 | 601 | 32.31 | 75.57 |
 | 13 | Step 11 again: step 12 reverted | 11cca82 | not run separately | | | | | |
 | 14 | Board test: the reverse graph in 2 MiB pages | 99aef00 | run-719b42059767 | 0.089 | 57.4 | 622 | 33.15 | 76.03 |
-| 15 | Step 11 again: step 14 reverted | pending | pending | | | | | |
+| 15 | Step 11 again: step 14 reverted | f09ad57 | not run separately | | | | | |
+| 16 | Board test: a barrier that spins briefly before sleeping | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -156,6 +157,13 @@ Huge pages are switched off for the whole process from the start (step 3), becau
 On our laptop this is about 3 ms slower, but there every new huge page also faults in the virtual machine's host, which the scoring machine does not have. Memory is unchanged and it is 22 lines longer. If both board runs are slower than step 11, we revert it.
 
 *Board result: 0.0890 s (run-719b42059767) and 0.0907 s (run-f60f3a5c7751), against 0.0893 s and 0.0909 s for step 11. The same speed within noise, so TLB misses on the reverse graph are not what limits the searches on that CPU. With 22 more lines it scores lower, so step 15 goes back to step 11's code.*
+
+### Step 16 (board test): spin briefly at barriers
+The program has nine parallel phases, and between them the worker threads wait at a barrier while the main thread does short serial work. The standard barrier puts a waiting thread to sleep in the kernel. The scoring machine fixes its clock speed, but idle cores can still enter deep sleep states, and waking one takes tens of microseconds, up to a few hundred, about 18 times per run.
+
+The new barrier spins for about 2,000 `pause` instructions (tens of microseconds) before it sleeps. Most waits end within that window, so the thread never sleeps. A long wait still sleeps, so a waiting thread does not take execution slots from its busy hyperthread sibling for long. Spinning without a limit was much slower in step 7's experiments for exactly that reason.
+
+Locally it is level with step 11 over 30 interleaved runs, but our virtual machine does not show the host's sleep states, so only the board can tell. It is 10 lines longer. If both board runs are no faster than step 11, we revert it.
 
 ---
 
