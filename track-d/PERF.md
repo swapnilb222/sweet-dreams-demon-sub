@@ -45,6 +45,8 @@ Each step is one push. A push is run once per team, so most steps have two board
 | 21 | Step 19 again, on a quiet box (kept) | 55eeb87 | run-86a463aba615 | 0.086 | 58.5 | 596 | 33.72 | 76.40 |
 | 22 | The same program in 9 fewer lines | c09205a | run-0638cc93d96a | 0.086 | 58.9 | 587 | 33.76 | 76.42 |
 | 23 | The same program in 9 fewer lines again | 640d57d | run-325981a15163 | **0.0856** | **57.9** | **578** | **34.12** | **76.65** |
+| 24 | 16-bit distance labels, with an exact 64-bit rerun (busy box: Track A 6% and 10% slow) | ca05322 | run-c43ea24c24c4, run-f85df36b8aba | 0.0855 | 58.6 | 587 | 33.96 | 76.55 |
+| 25 | Step 24 in 8 fewer lines (busy box: Track A 20% slow) | 5f88cb7 | run-0615a8689401 | 0.0854 | 58.4 | 579 | 34.08 | 76.63 |
 
 ---
 
@@ -121,6 +123,15 @@ Each of these looked plausible but depended on the scoring machine itself, so th
 
 Each was reverted. The repeat runs of step 11's code (steps 13, 15 and 17) also showed how much the board drifts: identical code measured 0.087 s in one session and 0.091 s in another.
 
+### Steps 24 and 25: smaller distance labels
+A search spends much of its time reading and writing distance labels, so their size decides how many cache lines it touches. Almost every answer here is small: the median is about 1,200 and the 99th percentile about 8,500. So the searches now keep 16-bit labels, a quarter of the size of the 64-bit ones.
+
+A 16-bit label saturates at 65,535. Any label below that is the length of a real path, so a result below it is exact. A query whose answer is 65,535 or more, or that has no path at all, is answered again with 64-bit labels. That is 16 of the 2,000 queries on the generated inputs, and they cost about 1.5% of the query time. The 64-bit search is created only for threads that need it. The query phase went from about 22.9 to 21.0 ms on our machine.
+
+Both board runs of step 24 landed on a busy box, as Track A ran 6% and 10% slower than its usual time. Even so, one of them tied our best time. Step 25 is the same machine code with 8 header lines removed, since the other headers already include them in the pinned compiler image. Its run again came on a busy box, with Track A 20% slow, and again tied our best time.
+
+Besides the full test battery, these steps were checked on 60 new random graphs with answers around 65,535 and weights up to the largest 32-bit value, against a plain Dijkstra, at 1, 2, 5 and 12 threads.
+
 ### Steps 18 to 23: fewer instructions, fewer lines
 The scoring CPU runs at a fixed 2.5 GHz, so instructions matter there. We counted them exactly with Valgrind on the sample input. The search's bucket drain executes about half of them. Three changes cut the total by 4.8%:
 - **Rare paths out of line.** Growing a bucket, jumping to the far heap, and starting a new distance page are rare. Kept inline, they made the hot loop spill its own values to the stack.
@@ -149,7 +160,8 @@ Each idea was measured against the version before it and dropped when it did not
 - **Other bucket widths (32, 128) and probe lengths (128, 512):** within noise of 64 and 256.
 - **Pruning edges that cannot beat the best meeting point:** no gain.
 - **Scheduling long queries first:** all threads already finish within about 1 ms of each other.
-- **32-bit or 16-bit distances, with a 64-bit rerun for long queries:** no faster.
+- **32-bit or 16-bit distances, with a 64-bit rerun for long queries:** no faster on an early version of the search. On the current one, 16-bit labels pay off (steps 24 and 25).
+- **Label pages of 64, 256 or 512 entries for the 16-bit labels, and probe lengths of 64, 128 and 512:** within noise of 128 and 256.
 - **Deeper prefetching in the search:** no gain, which showed the search is limited by its own instructions, not by memory.
 
 **Renumbering**
