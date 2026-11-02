@@ -1,4 +1,4 @@
-// Speed Demon 2026, Track C (Join). v18.
+// Speed Demon 2026, Track C (Join). v23.
 //
 // Threads: one per CPU, spawned as a tree before anyone faults memory in
 // (a page fault can hold up the mmap lock that creating a thread needs). They
@@ -22,13 +22,15 @@
 //     as empty). A quoted field of r raw bytes and q quotes holds a value of
 //     r - q/2 - 1 bytes. The name bucket and the region row are prefetched.
 //  4. Totals per thread and group, and the name's dense number: the hash's top
-//     15 bits pick a 64-byte bucket of eight slots, each a 47-bit tag above a
-//     17-bit number (62 bits of identity: among 100k names, a false match has
-//     odds of about 1 in 10^9). The bitset word is prefetched for writing.
-//  5. Distinct names: an atomic OR into the group's bitset over numbers; a
-//     bit that was clear is a new distinct name.
-// The shared tables sit on huge pages (fewer TLB misses); a piece's file pages
-// are dropped once parsed (else exit unmaps them all on one thread).
+//     14 bits pick a 64-byte bucket of eight slots, each a 47-bit tag above a
+//     17-bit number (61 bits of identity: among 100k names, a false match has
+//     odds of about 1 in 4 x 10^8). The bitset word is prefetched for writing.
+//  5. Distinct names: an atomic OR sets bit (group, name) of a bitset laid out
+//     [name / 64][group], so it grows with the names seen (~3 MiB); after
+//     parsing, the threads popcount it in shares.
+// The name buckets and the bitset's head sit on two huge pages (fewer TLB
+// misses), all of them used; a piece's file pages are dropped once parsed
+// (else exit unmaps them all on one thread). Board-style peak memory: ~9 MB.
 #include <bits/stdc++.h>
 #include <fcntl.h>
 #include <immintrin.h>
@@ -39,20 +41,23 @@ using u64 = uint64_t;
 using V = __m256i;
 using U = u64 __attribute__((may_alias, aligned(1))); // an unaligned word
 #define LD(p) _mm256_loadu_si256((const V *)(p))
-#define EQ(v, c) (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)))
+#define MASK(x) (unsigned)_mm256_movemask_epi8(x)
+#define EQ(v, c) MASK(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)))
 #define EQ64(a, b, c) (EQ(a, c) | (u64)EQ(b, c) << 32)
+// Commas and LFs at once: a byte equals the table entry its low nibble picks
+// (',' at 0xC, LF at 0xA, 0x80 elsewhere; bytes >= 0x80 pick 0).
+#define SEP(v) MASK(_mm256_cmpeq_epi8(_mm256_shuffle_epi8(sep, v), v))
 #define POP __builtin_popcountll
 #define RW PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
-// ROW: bitset words per group (2^17 name numbers).
-constexpr long ROW = 1 << 11, PIECE = 1 << 20, BIAS = 1l << 40;
+// Name buckets: 2^BB of eight slots (1 MiB).
+constexpr long BB = 14, PIECE = 1 << 20, BIAS = 1l << 40;
 
 // Totals of a group: count, id sum, amount sum, name bytes | note bytes << 32,
 // BIAS + max amount, BIAS - min amount, distinct names. Zero is empty, and
 // merging is sums and maxima.
 using Tot = long[8];
-// tab: name buckets (2 MiB), then bitsets (4 MiB).
 static char *in, *rg, *tab, keep[64];
-static u64 len, rlen, nreg, T, ngroups;
+static u64 len, rlen, nreg, T, ngroups, G;
 static unsigned char *group_of;
 static atomic<u64> *buckets, *seen, next_piece, next_number;
 static atomic<unsigned char> code_group[17576];
@@ -71,25 +76,25 @@ static u64 digits(const char *e, u64 n) { return (*(U *)(e - 8) ^ 0x303030303030
 // Words of eight digit values to numbers, four at a time.
 static void decode(const u64 *w, unsigned *out, u64 n) {
   for (u64 i = 0; i < n; i += 4) {
-    V v = _mm256_madd_epi16(_mm256_maddubs_epi16(LD(w + i), _mm256_set1_epi16(0x010A)), _mm256_set1_epi32(0x10064));
-    v = _mm256_madd_epi16(_mm256_packus_epi32(v, v), _mm256_set1_epi32(0x12710));
-    _mm_storeu_si128((__m128i *)(out + i), _mm256_castsi256_si128(_mm256_permute4x64_epi64(v, 0b1000)));
+    V v = _mm256_maddubs_epi16(LD(w + i), _mm256_set1_epi16(0x010A));
+    v = _mm256_madd_epi16(v, _mm256_set1_epi32(0x10064)), v = _mm256_packus_epi32(v, v);
+    v = _mm256_madd_epi16(v, _mm256_set1_epi32(0x12710)), v = _mm256_permute4x64_epi64(v, 8);
+    _mm_storeu_si128((__m128i *)(out + i), _mm256_castsi256_si128(v));
   }
 }
 // AES hash of the n raw bytes at p, 32 at a time; adds their quotes to q.
 static u64 hash_of(const char *p, u64 n, u64 &q) {
   __m128i k = _mm_set_epi64x(0x1D8E4E27C47D124F, n ^ 0x589965CC75374CC3), h = k;
-  for (u64 i = 0;; i += 32) {
+  for (u64 i = 0; !i || i < n; i += 32) {
     V b = _mm256_and_si256(LD(p + i), LD(keep + 32 - min<u64>(n - i, 32)));
-    h = _mm_aesenc_si128(_mm_xor_si128(h, _mm256_castsi256_si128(b)), _mm256_extracti128_si256(b, 1));
-    q += POP(EQ(b, '"'));
-    if (i + 32 >= n) break;
+    __m128i lo = _mm256_castsi256_si128(b), hi = _mm256_extracti128_si256(b, 1);
+    h = _mm_aesenc_si128(_mm_xor_si128(h, lo), hi), q += POP(EQ(b, '"'));
   }
   return _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_aesenc_si128(h, k), k));
 }
 // The dense number of a name, given its hash.
 static u64 intern(u64 h, u64 &spare) {
-  atomic<u64> *b = buckets + (h >> 49) * 8;
+  atomic<u64> *b = buckets + (h >> (64 - BB)) * 8;
   u64 tag = (h & ((1ull << 47) - 1)) | 1, f = 0;
   V want = _mm256_set1_epi64x(tag);
   for (int i = 0; i < 2; ++i) { // the eight tags, four at a time
@@ -98,19 +103,22 @@ static u64 intern(u64 h, u64 &spare) {
   }
   if (__builtin_expect(f != 0, 1)) return b[__builtin_ctz(f)] & 0x1FFFF;
   // New here (or spilled past its full bucket): first free slot from the
-  // bucket on, claimed with a CAS. Numbers are reserved 32 at a time.
-  spare = spare % 32 ? spare : next_number.fetch_add(32);
-  for (u64 i = b - buckets;; i = (i + 1) % (8 << 15)) {
-    u64 cur = buckets[i]; // a failed CAS leaves the slot's value here
-    if ((!cur && buckets[i].compare_exchange_strong(cur, tag << 17 | spare)) || cur >> 17 == tag)
-      return cur ? cur & 0x1FFFF : spare++;
-  }
+  // bucket on, claimed with a CAS. Numbers are reserved 32 at a time: spare
+  // holds the next one, and the end of its block in the high half.
+  if ((unsigned)spare == spare >> 32) spare = (next_number.fetch_add(32) + 32) * 0x100000001 - 32;
+  // A failed CAS leaves the slot's value in cur.
+  for (u64 i = b - buckets, cur, mine = tag << 17 | (unsigned)spare;; i = (i + 1) % (8 << BB))
+    if ((!(cur = buckets[i]) && buckets[i].compare_exchange_strong(cur, mine)) || cur >> 17 == tag)
+      return cur ? cur & 0x1FFFF : spare++ & 0x1FFFF;
 }
 
 static void work(int t, int span) {
   for (; span > 1; span -= span / 2) thread(work, t + span - span / 2, span / 2).detach();
   sync_all->arrive_and_wait(); // every thread exists
-  if (t < 3) tab[(size_t)t << 21] = 0; // fault in a huge page each
+  // Fault in the two huge pages, one thread each, while the others parse
+  // regions. No one else touches them yet: racing faults would each allocate
+  // (and be charged) a 2 MiB page.
+  if (t < 2) tab[t << 21] = 0;
   // regions.csv: slice t holds the lines whose preceding LF is in it.
   char *p = (char *)memchr(rg + rlen * t / T, '\n', rlen) + 1, *e = rg + min(rlen * (t + 1) / T, rlen - 1);
   for (u64 id = 0; p <= e; id = 0, p += 5) {
@@ -121,25 +129,32 @@ static void work(int t, int span) {
     group_of[id] = g;
   }
   sync_all->arrive_and_wait();
-  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0); // only the tables get huge pages
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0); // the bitset's tail gets 4 KB pages
+  G = ngroups + 1;
   Tot tot[256] = {};
-  unsigned pos[4096], qb[1024], nm[3][516];
-  u64 qm[1024], dg[3][516], hs[512], lens[512], spare = 0;
-  long sg[512];
-  for (u64 claim; (claim = next_piece.fetch_add(PIECE)) < len;) {
-    u64 end = min(claim + PIECE, len), at = max<u64>(claim, 1) - 1, filled = 0, inside = 0, quotes = 0;
+  const u64 lo = 0x8080808080808080, hi = 0x8080802C800A8080;
+  const V sep = _mm256_set_epi64x(hi, lo, hi, lo);
+  const __m128i ones = _mm_set1_epi8(-1);
+  unsigned pos[1280], qb[64], nm[3][260];
+  u64 qm[64], dg[3][260], hs[256], lens[256], spare = 0;
+  long sg[256];
+  for (u64 claim = next_piece, size; claim < len;) {
+    // 1 MiB pieces; the last T MiB in quarters, so the threads finish together.
+    if (!next_piece.compare_exchange_weak(claim, claim + (size = claim + T * PIECE < len ? PIECE : PIECE / 4))) continue;
+    u64 end = min(claim + size, len), at = max<u64>(claim, 1) - 1, filled = 0, inside = 0, quotes = 0;
     while (at < len && !(in[at] == '\n' && (isdigit(in[at + 1]) || in[at + 1] == '\xEF'))) ++at;
     u64 rec = ++at, origin = at;
-    // Quote bytes before offset p, from the masks of the last 1024 blocks.
-    auto rank = [&](u64 p) { return qb[(p - origin) / 64 % 1024] + POP(_bzhi_u64(qm[(p - origin) / 64 % 1024], (p - origin) % 64)); };
+    // Quote bytes before offset p, from the masks of the last 64 blocks.
+    auto rank = [&](u64 p) { return qb[(p - origin) / 64 % 64] + POP(_bzhi_u64(qm[(p - origin) / 64 % 64], (p - origin) % 64)); };
     while (rec < end) {
       // 1. structure
       for (int s = 0; s < 32; ++s, at += 64) {
         _mm_prefetch(in + at + 4096, _MM_HINT_T0);
         V a = LD(in + at), b = LD(in + at + 32);
-        u64 q = EQ64(a, b, '"'), blk = (at - origin) / 64 % 1024;
-        u64 ins = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0)) ^ inside;
-        u64 m = (EQ64(a, b, ',') | EQ64(a, b, '\n')) & ~ins, k = POP(m);
+        u64 q = EQ64(a, b, '"'), blk = (at - origin) / 64 % 64;
+        __m128i odd = _mm_clmulepi64_si128(_mm_cvtsi64_si128(q), ones, 0);
+        u64 ins = _mm_cvtsi128_si64(odd) ^ inside;
+        u64 m = (SEP(a) | (u64)SEP(b) << 32) & ~ins, k = POP(m);
         inside = (long)ins >> 63, qm[blk] = q, qb[blk] = quotes, quotes += POP(q);
         // Eight stores always (those past the count are overwritten later),
         // so the usual count needs no unpredictable loop exit.
@@ -152,7 +167,8 @@ static void work(int t, int span) {
         const unsigned *f = pos + n * 5;
         u64 stop = f[4] - (in[f[4] - 1] == '\r'), neg = in[f[3] + 1] == '-', w = digits(in + stop, stop - f[3] - 1 - neg);
         dg[0][n] = digits(in + f[0], f[0] - rec - (in[rec] == '\xEF') * 3);
-        dg[1][n] = (w & 0xFFFFFFFFFF) << 8 | w >> 48 << 48; // squeeze out the dot
+        // The amount, with its dot squeezed out.
+        dg[1][n] = (w & 0xFFFFFFFFFF) << 8 | w >> 48 << 48;
         dg[2][n] = digits(in + f[3], f[3] - f[2] - 1);
         sg[n] = -(long)neg;
       }
@@ -165,27 +181,32 @@ static void work(int t, int span) {
         u64 tq = (r = rank(f[2])) - before - nq - (r1 ? 2 : 0);
         lens[i] = (r1 ? r1 - 2 - nq / 2 : 0) | (r2 ? r2 - 1 - tq / 2 : 0) << 32;
         nm[2][i] = nm[2][i] < nreg ? nm[2][i] : 0;
-        _mm_prefetch((const char *)(buckets + (hs[i] >> 49) * 8), _MM_HINT_T0);
-        _mm_prefetch((const char *)group_of + nm[2][i], _MM_HINT_T0);
+        _mm_prefetch((char *)(buckets + (hs[i] >> (64 - BB)) * 8), _MM_HINT_T0);
+        _mm_prefetch((char *)group_of + nm[2][i], _MM_HINT_T0);
       }
       // 4. totals and name numbers
       for (u64 i = 0; i < n; ++i) {
         u64 g = group_of[nm[2][i]];
         long a = (nm[1][i] ^ sg[i]) - sg[i], *o = tot[g];
         o[0]++, o[1] += nm[0][i], o[2] += a, o[3] += lens[i], o[4] = max(o[4], BIAS + a), o[5] = max(o[5], BIAS - a);
-        hs[i] = g * ROW * 64 + intern(hs[i], spare);
-        _mm_prefetch((const char *)(seen + hs[i] / 64), _MM_HINT_ET0);
+        // Bitset words are [name / 64][group]: memory grows with the names
+        // seen, not a guessed maximum. hs: word << 6 | bit.
+        u64 name = intern(hs[i], spare);
+        hs[i] = ((name / 64) * G + g) << 6 | name % 64;
+        _mm_prefetch((char *)(seen + (hs[i] >> 6)), _MM_HINT_ET0);
       }
-      // 5. distinct names
-      for (u64 i = 0; i < n; ++i) {
-        u64 bit = 1ull << hs[i] % 64;
-        tot[hs[i] / 64 / ROW][6] += !(seen[hs[i] / 64].fetch_or(bit, memory_order_relaxed) & bit);
-      }
+      // 5. distinct names: set the bit (counted by popcount at the end)
+      for (u64 i = 0; i < n; ++i) seen[hs[i] >> 6].fetch_or(1ull << hs[i] % 64, memory_order_relaxed);
       filled -= n * 5;
       memmove(pos, pos + n * 5, filled * 4);
     }
     madvise((void *)(in + claim), end - claim, MADV_DONTNEED);
+    claim = next_piece;
   }
+  // Distinct names per group: popcounts of this thread's share of the words.
+  sync_all->arrive_and_wait();
+  u64 w = (next_number / 64 + 1) * G;
+  for (u64 i = w * t / T; i < w * (t + 1) / T; ++i) tot[i % G][6] += POP(seen[i]);
   mu.lock();
   for (int i = 0; i < 256 * 8; ++i) {
     long &a = all[i / 8][i % 8], b = tot[i / 8][i % 8];
@@ -203,10 +224,13 @@ int main() {
   // Regions are listed in ascending id order: the last line has the largest.
   nreg = strtoul((char *)memrchr(rg, '\n', rlen - 1) + 1, 0, 10) + 1;
   group_of = (unsigned char *)mmap(0, nreg, RW, -1, 0);
-  // Three huge pages, 2 MiB aligned.
-  tab = (char *)mmap(0, 8 << 20, RW, -1, 0), tab += -(uintptr_t)tab & ((2 << 20) - 1);
-  madvise(tab, 6 << 20, MADV_HUGEPAGE);
-  buckets = (atomic<u64> *)tab, seen = (atomic<u64> *)(tab + (2 << 20));
+  // Name buckets (1 MiB), then the bitset (2^17 names x 256 groups at most,
+  // ~3 MiB used), 2 MiB aligned. The first 4 MiB are two huge pages, all of
+  // them used, so the random lookups miss the TLB less; the bitset's tail
+  // gets 4 KB pages, charged only as touched.
+  tab = (char *)mmap(0, 7 << 20, RW, -1, 0), tab += -(uintptr_t)tab & ((2 << 20) - 1);
+  madvise(tab, 4 << 20, MADV_HUGEPAGE);
+  buckets = (atomic<u64> *)tab, seen = buckets + (8 << BB);
   barrier<> b(T);
   sync_all = &b, work(0, T);
   // Countries in code order, then _UNMATCHED (group 0). Cents / 100 as a
@@ -215,10 +239,11 @@ int main() {
   for (int c = 0; c <= 17576; ++c) {
     unsigned g = c < 17576 ? code_group[c].load() : 0;
     long *o = all[g];
-    char code[4] = {char('A' + c / 676), char('A' + c / 26 % 26), char('A' + c % 26)};
-    if ((g || c == 17576) && o[0])
-      fprintf(out, "%s %ld %ld %.2f %.2f %.2f %ld %ld %ld\n", g ? code : "_UNMATCHED", o[0], o[1], o[2] / 100.,
-              (BIAS - o[5]) / 100., (o[4] - BIAS) / 100., o[6], o[3] & 0xFFFFFFFF, o[3] >> 32);
+    if ((c < 17576 && !g) || !o[0]) continue;
+    g ? fprintf(out, "%c%c%c", 'A' + c / 676, 'A' + c / 26 % 26, 'A' + c % 26) : fputs("_UNMATCHED", out);
+    double sum = o[2] / 100., lo = (BIAS - o[5]) / 100., hi = (o[4] - BIAS) / 100.;
+    fprintf(out, " %ld %ld %.2f %.2f %.2f", o[0], o[1], sum, lo, hi);
+    fprintf(out, " %ld %ld %ld\n", o[6], o[3] & 0xFFFFFFFF, o[3] >> 32);
   }
   fclose(out);
   _exit(0);

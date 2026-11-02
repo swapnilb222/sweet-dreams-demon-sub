@@ -15,11 +15,12 @@ Local numbers (in the notes) were measured on a laptop (Intel Core Ultra 7 265U,
 | 6 | Name id = slot of its 64-bit key in a 4-wide AVX2-probed table (no separate key store: less cache pressure under 12 threads); write-hot counters padded off read-only lines; 1 MB pieces (local, 12 threads: ~25–30 ms, 1 thread: ~110 ms, S = 462 lines) | | | | |
 | 7 | Batched structural scan: carry-less multiply turns the quote mask into an inside-quotes mask, so every record is five structural offsets with no branch on field shape; AES name hash over a masked 32-byte load (no byte loop); 8-slot cache-line buckets holding tag + dense 17-bit number (local, 1 thread: 127 ms; slower than step 6 until steps 8–9) | | | | |
 | 8 | Always-8 offset stores (no mispredicted loop exit per 64-byte block); hot pointers copied out of the lambda's captures into registers; per-block quote rank instead of a quote count per offset; digits decoded four records at a time with `maddubs`/`madd` (local, 1 thread: 127 → 91 ms) | | | | |
-| 9 | Threads spawned as a tree before any page is faulted (a page fault was holding up thread creation for ~1.5 ms); shared tables on 3 transparent huge pages; input prefetched 4 KB ahead (1 thread: 91 → 85 ms); `-march=raptorlake` for the scoring box's i5-13500; code reorganised and compacted, S = 462 → 207 lines (local, 12 threads: ~20–23 ms, board-style M 11.2 MB) | | | | |
+| 9 | Threads spawned as a tree before any page is faulted (a page fault was holding up thread creation for ~1.5 ms); shared tables on 3 transparent huge pages; input prefetched 4 KB ahead (1 thread: 91 → 85 ms); `-march=raptorlake` for the scoring box's i5-13500; code reorganised and compacted, S = 462 → 207 lines (local, 12 threads: ~20–23 ms, board-style M 11.2 MB) | (commit 0a20695) | 0.023 | 11 | 82.87 (K 45.43, S 213) |
+| 10 | Memory 11 → 8.9 MB (board-style `memory.peak`): bucket table halved to 1 MiB (8-slot buckets at 76% load; spills take the slow path); bitset laid out `[name / 64][group]` with one column per country present, so it grows with the names seen (~3 MiB) instead of a fixed 4 MiB; the two huge pages hold only buckets + bitset head (all used), and nobody else touches them while they fault (racing THP faults each charged a 2 MiB page: +4–8 MB peak); commas and LFs found with one `pshufb` lookup; distinct names by popcount after parsing (no stores between the locked ORs); smaller per-thread arrays; the last T MiB claimed in 256 KiB pieces; fixed a latent bug (a fresh block of name numbers looked used up, so spilled lookups wasted numbers). Local, 12 threads: ~21 ms, unchanged | | | | |
 
 ## How the numbers were taken
 
-Tools live in `speed-demon-starter/dev-c` (every version `v4.cpp` … `v18.cpp` is kept there).
+Tools live in `speed-demon-starter/dev-c` (every version `v4.cpp` … `v23.cpp` is kept there).
 
 - `bench.sh rounds img...`: interleaved rounds of 10 runs of each image, pinned to 12 CPUs (`CPUS=2` for one thread). `runner.c` reports min/median wall, CPU, system time and peak RSS.
 - `mem.sh img...`: the board's M. It warms `/data` into the page cache from another container first, as the harness's `prewarm` does, then reads the run's cgroup `memory.peak`. Page-cache pages of the input are charged elsewhere, so M is anonymous memory plus the container's own ~5.4 MB floor.
@@ -41,8 +42,19 @@ Single thread, v11 → v18, full seed 1:
 Phase timeline at 12 threads (instrumented build, `dbg13`/`dbg14`): thread creation was 2–5 ms before the tree spawn and the early barrier, and 0.3–0.8 ms after. The region phase is bounded by the three huge-page faults, about 0.2 ms on bare metal but up to ~2 ms in the Docker Desktop VM. Parsing takes ~17 ms, the tail ~1 ms, and output ~0.3 ms.
 
 Tried and dropped:
+- `pread` into per-thread buffers instead of `mmap`, to avoid faults and TLB shootdowns: system time doubled because of the kernel copy.
+- 4 KB pages for every table: ~10% more CPU than huge pages.
+- Pre-faulting the bitset for 100k names: no gain, +0.9 MB.
 - 4 KB pages for the tables, populated in parallel: slower than huge pages.
 - 256 KB pieces: more system time with no tail gain.
 - `MADV_POPULATE_READ` per piece: no gain once the input is prefetched.
 - Prefetch distances of 1, 2 and 8 KB: 4 KB was best.
 - PGO, step 6: small and noisy.
+
+## Where the time goes now (single thread, v22 profile)
+
+- Input stream loads: 22% of samples. The structure pass is ~25 instructions per 64 bytes; the stall is the DRAM stream sharing fill buffers with the table prefetches.
+- `lock or` into the bitset: 14%. It is a full fence.
+- Name interning plus the bitset footprint: 20–25%, measured by knocking each stage out (the output is then wrong).
+
+Board arithmetic, with K = (T_ref/T)^0.5 × (M_ref/M)^0.2 × (S_ref/S)^0.15: at M = 9 MB and S ≈ 220, 86 points needs T ≈ 19 ms.
