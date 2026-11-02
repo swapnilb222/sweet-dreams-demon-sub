@@ -17,11 +17,12 @@ Local numbers (in the notes) were measured on a laptop (Intel Core Ultra 7 265U,
 | 8 | Always-8 offset stores (no mispredicted loop exit per 64-byte block); hot pointers copied out of the lambda's captures into registers; per-block quote rank instead of a quote count per offset; digits decoded four records at a time with `maddubs`/`madd` (local, 1 thread: 127 → 91 ms) | | | | |
 | 9 | Threads spawned as a tree before any page is faulted (a page fault was holding up thread creation for ~1.5 ms); shared tables on 3 transparent huge pages; input prefetched 4 KB ahead (1 thread: 91 → 85 ms); `-march=raptorlake` for the scoring box's i5-13500; code reorganised and compacted, S = 462 → 207 lines (local, 12 threads: ~20–23 ms, board-style M 11.2 MB) | (commit 0a20695) | 0.023 | 11 | 82.87 (K 45.43, S 213) |
 | 10 | Memory 11 → 8.9 MB (board-style `memory.peak`): bucket table halved to 1 MiB (8-slot buckets at 76% load; spills take the slow path); bitset laid out `[name / 64][group]` with one column per country present, so it grows with the names seen (~3 MiB) instead of a fixed 4 MiB; the two huge pages hold only buckets + bitset head (all used), and nobody else touches them while they fault (racing THP faults each charged a 2 MiB page: +4–8 MB peak); commas and LFs found with one `pshufb` lookup; distinct names by popcount after parsing (no stores between the locked ORs); smaller per-thread arrays; the last T MiB claimed in 256 KiB pieces; fixed a latent bug (a fresh block of name numbers looked used up, so spilled lookups wasted numbers). Local, 12 threads: ~21 ms, unchanged | (commit f984f5b) | 0.024 | 9 | 83.17 (K 46.06, S 220) |
-| 11 | Batches of 16 blocks (1 KiB) instead of 32: per-thread batch arrays shrink from ~37 to ~20 KiB, because the box runs two threads per core on a shared 48 KiB L1; input pages dropped once per 4 MiB region by the thread finishing its last piece (a quarter of the `MADV_DONTNEED` calls, each a TLB-shootdown IPI to every core running the process). Local, 12 threads: CPU 279 → 256 ms (median of 5 interleaved rounds), board-style M 8.7 MB, S 221 | | | | |
+| 11 | Batches of 16 blocks (1 KiB) instead of 32: per-thread batch arrays shrink from ~37 to ~20 KiB, because the box runs two threads per core on a shared 48 KiB L1; input pages dropped once per 4 MiB region by the thread finishing its last piece (a quarter of the `MADV_DONTNEED` calls, each a TLB-shootdown IPI to every core running the process). Local, 12 threads: CPU 279 → 256 ms (median of 5 interleaved rounds), board-style M 8.7 MB, S 221 | (commit 2975292) | 0.024 | 9 | 83.31 (K 46.36, S 227) |
+| 12 | Same engine in fewer lines. On the board the source counts with the same weight as wall time (exponent 0.15 vs 0.5): at M ≈ 9 MB, cutting S from 227 to 150 is worth as much as a 1.7 ms faster run. Dropped the features that cost lines without a measurable gain: popcount after parsing (back to counting from `fetch_or`), last-T-MiB quarter pieces, per-region DONTNEED. Country numbering by `call_once`; threads in a `jthread` pool behind a start barrier; output via one buffer per line. Fixed during the rewrite: a GCC vector `==` on `__m256i` compares 64-bit lanes, not bytes; a `long < 2u` comparison sent sums to `max`. Local, 12 threads: CPU 222 ms (v25: 237), median wall equal; M 9.1 MB; S 184 + 6 (Dockerfile) | | | | |
 
 ## How the numbers were taken
 
-Tools live in `speed-demon-starter/dev-c` (every version `v4.cpp` … `v25.cpp` is kept there).
+Tools live in `speed-demon-starter/dev-c` (every version `v4.cpp` … `v27.cpp` is kept there).
 
 - `bench.sh rounds img...`: interleaved rounds of 10 runs of each image, pinned to 12 CPUs (`CPUS=2` for one thread). `runner.c` reports min/median wall, CPU, system time and peak RSS.
 - `mem.sh img...`: the board's M. It warms `/data` into the page cache from another container first, as the harness's `prewarm` does, then reads the run's cgroup `memory.peak`. Page-cache pages of the input are charged elsewhere, so M is anonymous memory plus the container's own ~5.4 MB floor.
@@ -83,3 +84,18 @@ Result:
 Knocking out the atomic OR showed why: it is only ~5% of 12-thread time. Most of the cost is the three random table lines per record and the input stream, which partitioning does not remove. Xue et al. reach the same conclusion: for a single shared structure tuned to the task, partitioning does not pay. Dropped.
 
 Also measured, all within noise locally: batches of 8, 16 and 32 blocks; ring publish intervals.
+
+## Score arithmetic behind step 12
+
+points = 50 log10(K), with K = (14.444 / T)^0.5 × (367.4 MB / M)^0.2 × min(108 / S, 1)^0.15.
+
+At M ≈ 9 MB, the wall time T that gives 86 points:
+
+| S (code lines) | T for 86 |
+|---|---|
+| 227 | 18.8 ms |
+| 190 | 19.8 ms |
+| 150 | 21.3 ms |
+| 120 | 22.7 ms |
+
+The board has measured 23–24 ms for every version since step 9.
