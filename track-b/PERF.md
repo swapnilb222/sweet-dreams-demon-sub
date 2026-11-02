@@ -104,7 +104,7 @@ Row volume at full scale: 1.63 M rows and 1.42 M postings per phase (cold-term o
 | S (official `static_axes.py`, cached tools image) | **931** (v18: 932, v16: 905) |
 | D | 1 |
 
-If the board's time falls from v12's by the same 1.26–1.5× as in the local container batch, T would be about 0.14–0.17 s; at 0.15 s and K ≈ (56.352 / 0.15)^0.5 × 50^0.2 × (91 / 931)^0.15 ≈ 19.4 × 2.19 × 0.71 ≈ **30** (score ≈ 74). This is an estimate, not a result; the board decides. The goal of a score above 83 (K ≈ 46) would need T ≈ 0.065 s at this S. That is about twice as fast as the Rust program measured beside it, and is not reached.
+If the board's time falls from v12's by the same 1.26–1.5× as in the local container batch, T would be about 0.14–0.17 s. At 0.15 s, K ≈ (56.352 / 0.15)^0.5 × 50^0.2 × (91 / 931)^0.15 ≈ 19.4 × 2.19 × 0.71 ≈ **30** (score ≈ 74). This is an estimate, not a result; the board decides. The goal of a score above 83 (K ≈ 46) would need T ≈ 0.065 s at this S. That is about twice as fast as the Rust program measured beside it, and is not reached.
 
 ## Correctness and packaging checks (v16, repeated for v18 and v21)
 
