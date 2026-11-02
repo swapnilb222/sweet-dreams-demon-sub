@@ -17,7 +17,8 @@ Every step from the reference to the current version. Each step lists the live-b
 | 10 | Raw graph stored as four fixed slots per node | 65cc5ce | run-4efb9302d30e | **0.089** | **57.8** | **593** | **33.25** | **76.09** |
 | 11 | The raw graph's pages reused for the id map and forward offsets | 5491bc8 | run-940c564ae383 | 0.089 | 59.0 | 600 | 33.08 | 75.98 |
 | 12 | The input file unmapped by the parsing threads, not at exit | 6c0a85d | run-225c1dc47a94 | 0.095 | 56.0 | 601 | 32.31 | 75.57 |
-| 13 | Step 11 again: step 12 reverted | pending | pending | | | | | |
+| 13 | Step 11 again: step 12 reverted | 11cca82 | pending | | | | | |
+| 14 | Board test: the reverse graph in 2 MiB pages | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -146,6 +147,13 @@ Now each parsing thread unmaps its own slice of the file as soon as it has parse
 ### Step 13: back to step 11
 The code is exactly that of step 11, the version with the best board average so far (0.0893 s and 0.0909 s).
 
+### Step 14 (board test): huge pages for the reverse graph
+The scoring CPU's second-level TLB holds 2,048 page translations. With 4 KB pages that covers 8 MB, while the searches hop at random over 41 MB of graph, so most hops also miss the TLB and wait for a page-table walk. With 2 MiB pages the whole graph fits in the TLB.
+
+Huge pages are switched off for the whole process from the start (step 3), because partly used buffers would round up to 2 MiB and raise memory. They are allowed only for the reverse graph's offsets and edges, and only for the 2 MiB-aligned body of each array, so rounding wastes nothing. Each array is faulted in by all threads at once, each taking whole huge pages. The offsets are faulted in before the rename pass, which zeroes them anyway. The edges are faulted in once the edge copies are gone. That keeps the memory peak where it was. The forward graph stays on small pages: its offsets reuse the raw graph's pages (step 11), and faulting its edges early would raise the peak.
+
+On our laptop this is about 3 ms slower, but there every new huge page also faults in the virtual machine's host, which the scoring machine does not have. Memory is unchanged and it is 22 lines longer. If both board runs are slower than step 11, we revert it.
+
 ---
 
 ## Things we tried that did not help
@@ -176,12 +184,16 @@ Each idea was measured against the version before it and dropped when it did not
 - **Other bucket widths (32, 128) and probe lengths (128, 512).** All within noise of the current 64 and 256.
 - **Copying the edge-field width and masks into locals in the hot loops,** the way step 9 did for pointers. The compiler was already keeping them in registers: the disassembly has the same number of loads.
 - **Larger chain-walk batches (16, 32) and other BFS region sizes (256, 1024).** The renumbering got up to 2 ms faster with bigger batches, but the total was no better over 20 interleaved runs with the board's build.
+- **Cutting instructions in the search loop.** The board's CPU runs at a fixed 2.5 GHz with turbo off, so we counted instructions exactly with Valgrind's cachegrind on the sample input. The search's bucket drain executes about half of all instructions, about 80 per edge it relaxes. Moving its rare paths (growing a bucket, a far jump, a new label page) out of line, dropping a queue counter that every push updated, and a cheaper parser bookkeeping step cut the total by 4.8%, for 11 more lines. The phase timers showed the query phase about 1.5 ms faster. But the full profile-guided build was not faster over three sets of 25 to 30 interleaved runs, so we did not ship it. The board's time is only about 1.1 times our in-program time, which points to waiting on memory, not to arithmetic, as what dominates there.
+- **Three slots per node in the raw graph instead of four.** The input's out-degrees are 1 to 4 for 97% of nodes, with an average of 2.9, so four slots look wasteful. But three slots save only 0.5 MB and push 37% of the edges into the spill area, where each needs a second cache miss. Four slots (28.8 MB) are about as small as the raw graph gets: offsets plus edges would be 27 MB.
 - **A private claim bitmap per thread** during renumbering. It saves a little time, but adds 2.6 MB in that phase, which would become the new memory peak.
 - **A spinning barrier between phases** instead of the standard one, which sleeps. Much slower locally (median 127 ms against 101 ms), because a spinning thread takes execution slots from its busy hyperthread sibling.
 
 ---
 
 ## How we measured
+
+The scoring machine is an Intel i5-13500. Timed runs get its six P-cores with hyperthreading (CPUs 0 to 11), turbo is off, and the governor is fixed, so the cores run at about 2.5 GHz. The input is loaded into the page cache before the clock starts, and memory is capped at 8 GB without swap. Our laptop (Core Ultra 7 265U) has only two P-cores among its twelve cores and runs with turbo, so local timings are a rough guide. We trust a change only when it wins clearly in local interleaved runs and then on both board runs. Nothing in the program depends on the dataset's seed: every size, the contraction, and the fallback in the renumbering are derived from the input at run time.
 
 Changes were tested locally in Docker on a 12-thread laptop, with the input on a Linux volume and the file already in the page cache. We used the same timer and cgroup memory peak as the board. A profiling build prints the elapsed time and memory at each stage, and a background sampler records which stage reaches the peak. Old and new versions always ran alternately, so both saw the same machine load. We compared each stage's best time across several sessions.
 
