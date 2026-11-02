@@ -1,4 +1,4 @@
-// Speed Demon 2026, Track C (Join). v27: the same engine in fewer lines.
+// Speed Demon 2026, Track C (Join). v31.
 //
 // Threads: one per CPU in the affinity mask. They parse regions.csv in T
 // slices into a direct table region_id -> group (0 = unmatched), meet at a
@@ -45,7 +45,7 @@ using U = u64 __attribute__((may_alias, aligned(1))); // an unaligned word
 constexpr long PIECE = 1 << 20, B = 1l << 40;
 
 static char *in, *rg, *tab, keep[64];
-static u64 len, rlen, nreg, T, G;
+static u64 len, rlen, T, G;
 static unsigned char *group_of;
 static atomic<u64> *buckets, *seen, next_piece, next_number, ngroups;
 static atomic<unsigned char> code_group[17576];
@@ -130,7 +130,9 @@ static void work(u64 t) {
         // Commas and LFs: bytes equal to the table entry their low nibble picks.
         u64 m = (SEP(a) | SEP(b) << 32) & ~ins, k = POP(m);
         inside = (long)ins >> 63, qm[blk] = q, qb[blk] = quotes, quotes += POP(q);
-        for (u64 j = 0; j < 8 || m; ++j, m &= m - 1) pos[filled + j] = at + _tzcnt_u64(m);
+#pragma GCC unroll 8
+        for (u64 j = 0; j < 8; ++j, m &= m - 1) pos[filled + j] = at + _tzcnt_u64(m);
+        for (u64 j = 8; m; ++j, m &= m - 1) pos[filled + j] = at + _tzcnt_u64(m);
         filled += k;
       }
       // 2. numbers of the records that start in this piece
@@ -154,7 +156,7 @@ static void work(u64 t) {
         u64 r1 = f[1] - f[0] - 1, r2 = f[2] - f[1] - 1, nq = 0, before = r;
         hs[i] = hash_of(in + f[0] + 2, r1 < 2 ? 0 : r1 - 2, nq);
         u64 tq = (r = rank(f[2])) - before - nq - (r1 ? 2 : 0);
-        lens[i] = (r1 ? r1 - 2 - nq / 2 : 0) | (r2 ? r2 - 1 - tq / 2 : 0) << 32, nm[2][i] *= nm[2][i] < nreg;
+        lens[i] = (r1 ? r1 - 2 - nq / 2 : 0) | (r2 ? r2 - 1 - tq / 2 : 0) << 32;
         _mm_prefetch((char *)(buckets + (hs[i] >> 50) * 8), _MM_HINT_T0);
         _mm_prefetch((char *)group_of + nm[2][i], _MM_HINT_T0);
       }
@@ -184,9 +186,10 @@ int main() {
   sched_getaffinity(0, sizeof cs, &cs), T = CPU_COUNT(&cs);
   memset(keep, -1, 32), in = open_map("/data/records.csv", len);
   rg = open_map("/data/regions.csv", rlen);
-  // Regions are listed in ascending id order: the last line has the largest.
-  nreg = strtoul((char *)memrchr(rg, '\n', rlen - 1) + 1, 0, 10) + 1;
-  group_of = (unsigned char *)mmap(0, nreg, RW);
+  // Region ids are below 10^7 (spec 2.2), so no record needs a bounds check.
+  // Only the pages regions.csv writes are charged; a lookup elsewhere reads
+  // the kernel's shared zero page: group 0, unmatched.
+  group_of = (unsigned char *)mmap(0, 10'000'000, RW);
   // Name buckets (1 MiB), then the bitset (at most 2^17 names x 256 groups),
   // 2 MiB aligned; the first 4 MiB are huge pages.
   tab = (char *)mmap(0, 7 << 20, RW), tab += -(uintptr_t)tab & ((2 << 20) - 1);

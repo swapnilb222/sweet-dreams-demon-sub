@@ -21,10 +21,11 @@ Local numbers (in the notes) were measured on a laptop (Intel Core Ultra 7 265U,
 | 12 | Same engine in fewer lines. On the board the source counts with the same weight as wall time (exponent 0.15 vs 0.5): at M ≈ 9 MB, cutting S from 227 to 150 is worth as much as a 1.7 ms faster run. Dropped the features that cost lines without a measurable gain: popcount after parsing (back to counting from `fetch_or`), last-T-MiB quarter pieces, per-region DONTNEED. Country numbering by `call_once`; threads in a `jthread` pool behind a start barrier; output via one buffer per line. Fixed during the rewrite: a GCC vector `==` on `__m256i` compares 64-bit lanes, not bytes; a `long < 2u` comparison sent sums to `max`. Local, 12 threads: CPU 222 ms (v25: 237), median wall equal; M 9.1 MB; S 184 + 6 (Dockerfile) | (commit 4a45427) | 0.024 | 9 | 83.75 (K 47.32, S 190) |
 | 13 | Board experiment B: profile-guided build trained on seed 7 from a byte-identical copy of the published generator (not counted in S), and offset emission as 8 unrolled stores plus a loop for the rest (fewer instructions per block, for two hyperthreads sharing a core). Both within noise locally; pushed alone to measure on the box | (commit 575d90a) | ≥ 0.024 | 9 | no better than 83.75: the board kept step 12; reverted |
 | 14 | Board experiment A: step 12's code with one thread per physical core (6 of the 12 CPUs). On the box, 12 CPUs are 6 P-cores × 2 hyperthreads, and two threads of this loop on one core share its L1, L2 and fill buffers. Locally: CPU per run 242 → 186 ms (less interference), wall 23 → 31 ms (this laptop's 12 CPUs are mostly separate cores, so halving the threads halves its compute) | (commit 8af2833) | ≥ 0.024 | 9 | no better than 83.75: hyperthreads help on the box; reverted to step 12 |
+| 15 | Instructions counted exactly with Valgrind callgrind (1 thread, full seed 1), since local wall times swing 30–40%: step 12 runs 1,268 M instructions (382 per record). Offset emission as 8 unrolled stores plus a loop for the rest: 50 → 30 per record. Region table as a 10 M-entry virtual mapping (spec 2.2: ids < 10^7): pages regions.csv never writes read the kernel's zero page (group 0, uncharged), so the per-record bounds check and the max-id scan go. Total 1,268 → 1,162 M instructions (−8.4%); M ~9 MB, S 185 | | | | |
 
 ## How the numbers were taken
 
-Tools live in `speed-demon-starter/dev-c` (every version `v4.cpp` … `v29.cpp` is kept there).
+Tools live in `speed-demon-starter/dev-c` (every version `v4.cpp` … `v31.cpp` is kept there).
 
 - `bench.sh rounds img...`: interleaved rounds of 10 runs of each image, pinned to 12 CPUs (`CPUS=2` for one thread). `runner.c` reports min/median wall, CPU, system time and peak RSS.
 - `mem.sh img...`: the board's M. It warms `/data` into the page cache from another container first, as the harness's `prewarm` does, then reads the run's cgroup `memory.peak`. Page-cache pages of the input are charged elsewhere, so M is anonymous memory plus the container's own ~5.4 MB floor.
@@ -108,3 +109,29 @@ The board has measured 23–24 ms for every version since step 9.
 - **Explicitly unrolled offset emission:** 8 unrolled stores, then a loop only for further offsets, instead of "at least 8" iterations. Fewer instructions per block should matter when two hyperthreads share a core, but locally it is within noise.
 
 Local timings on this laptop now swing 30–40% between runs (1 thread: 100–145 ms; 12 threads: median 28–30 ms). The 12 threads also run mostly on E-cores, unlike the box's 6 P-cores × 2. So remaining 5–10% effects can only be measured on the board itself.
+
+## Instruction counts (callgrind, 1 thread, full seed 1)
+
+`dev-c/vg.sh src.cpp` builds with `-g` and runs callgrind in a Debian container. Unlike wall time it is exact and repeatable, and on the box (fixed 2.5 GHz, two hyperthreads per core) instructions are what the cores share.
+
+| variant | instructions | note |
+|---|---|---|
+| step 12 (v27) | 1,268 M | 382 per record |
+| + unrolled emission (v30a) | 1,187 M | −6.4% |
+| + neighbouring bucket always checked (v30b) | 1,236 M | worse: the extra compares cost more than the spills they save |
+| + 2 MiB buckets (v30c) | 1,137 M | −4.2% more, but +1 MB of memory: about even on K |
+| + next bucket only when this one is full (v30d) | 1,175 M | −1% for 5 lines |
+| + hash folded into the numbers pass (v30e) | 1,178 M | no gain: loop overhead is not the cost |
+| + region table without a bounds check (v31) | 1,162 M | shipped as step 15 |
+
+Remaining per-record costs, in instructions:
+
+| item | instructions per record |
+|---|---|
+| offset emission | 30 |
+| digit extraction (3 fields) | 24 |
+| hash and lengths | 22 |
+| totals | 18 |
+| field offsets | 12 |
+| name number | 10 |
+| rank and quote counts | 11 |
