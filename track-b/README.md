@@ -43,7 +43,7 @@ Only the C++ standard library and Linux system calls. `dependency_count = 0`, so
 
 ## Validation and measurements
 
-See [PERF.md](PERF.md). Development sources (v1–v20), benchmark and test scripts live in [../dev-b](../dev-b), outside the scored folder. The canonical reference is `../../speed-demon-2026/reference/b_index.py`.
+See [PERF.md](PERF.md). Development sources (v1–v21), benchmark and test scripts live in [../dev-b](../dev-b), outside the scored folder. The canonical reference is `../../speed-demon-2026/reference/b_index.py`.
 
 ## With another 24 hours
 

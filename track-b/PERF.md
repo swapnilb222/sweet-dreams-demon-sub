@@ -2,7 +2,7 @@
 
 ## Status: 2026-11-02
 
-The submitted version is **v18**: one scan of the corpus in phases of about 32 MB. Each phase is indexed at document level (lists of 16-bit ids, bitmaps for common terms), every query is answered on that phase into a running tally, and the phase is then dropped (see [README.md](README.md)). The previous submission, v12 (commit `4d0be41`), is the only one with a board result so far: **T 0.217 s, M 41 MB, S 802, D 1, K 25.42, speed score 70.26** (rank 29 when recorded; its run ID was not noted). v16 (commit `840e714`) and v18 have no board result recorded here yet.
+The submitted version is **v21**: one scan of the corpus in phases of about 32 MB. Each phase is indexed at document level (lists of 16-bit ids, bitmaps for common terms), every query is answered on that phase into a running tally, and the phase is then dropped (see [README.md](README.md)). The previous submission, v12 (commit `4d0be41`), is the only one with a board result so far: **T 0.217 s, M 41 MB, S 802, D 1, K 25.42, speed score 70.26** (rank 29 when recorded; its run ID was not noted). v16 (commit `840e714`), v18 (`735459a`) and v21 have no board result recorded here yet.
 
 The v13 restructuring borrows its overall plan from a Rust Track B program we studied (`trackb_refm.rs`): phases with 16-bit postings; phrase matches written as rows of a pseudo-term, so that a phrase query becomes a one-term lookup; per-query tallies owned by one thread at a time (no atomics on results); answering phase k − 1 on the threads that have run out of scan work in phase k; row chunks per shard, sorted by claim order instead of sorting rows; a futex barrier that spins first. Unlike that program, lookups stay exact. It compares 47 bits of a hash and accepts a rare false match, whereas v13–v16 verify every hit (see v15 below). v1–v5 are the earlier posting-list design and v6–v12 the block design, both kept below for the record.
 
@@ -85,31 +85,33 @@ Local measurements below are on the same laptop as above. It throttles under 12 
 | v16 (commit `840e714`) | 8 KB batches (the per-thread token arrays scale with them), 32-row chunks (less half-empty space per claim), unpadded tallies | **37.5 MiB cgroup peak**; container min / median 173 / 179 ms vs v14 180 / 186 and Rust program 131 / 148 in the same batch; natively at 12 threads v14 / v15 / v16 medians 0.169 / 0.171 / 0.176 s, within noise |
 | attribution on v16 (single thread, min of 7) | scan 1972 M cycles = 54 / token: tokenize + key + hash 20.6, lookup 18, bookkeeping 15, phrase checks 3.5; routing rows to shards ≈ 0 | |
 | v17 | a lookup needs only the 64-bit tag and k1, so k0 is no longer stored per token (k1 = 1 marks a document id, 2 a token over 32 bytes); the hash drops its final xorshift (the multiply alone is a bijection); 12 unconditional position stores per 64 bytes instead of 16 | scan 1961 → 1851 M cycles (−5.6 %) |
-| **v18** = `main.cpp` | count and id sum of a bitmap result with AVX2 nibble tables (`count_bits`, the technique of the Rust program's `add_bits`) instead of seven popcounts per word | answer 340 → 273 M cycles (−20 %); single-thread scan + answer + build 2422 → 2181 M cycles vs v16 (−10 %); container min / median 157 / 178 ms vs v16 163 / 170 in one batch (within noise); 35–36.5 MiB |
+| v18 (commit `735459a`) | count and id sum of a bitmap result with AVX2 nibble tables (`count_bits`, the technique of the Rust program's `add_bits`) instead of seven popcounts per word | answer 340 → 273 M cycles (−20 %); single-thread scan + answer + build 2422 → 2181 M cycles vs v16 (−10 %); container min / median 157 / 178 ms vs v16 163 / 170 in one batch (within noise); 35–36.5 MiB |
 | v19 (not kept) | a 256 KB bit filter in front of the table, so most non-query tokens look in an empty bucket | scan +19 %: the 2 MB table already sits in this laptop's 2 MB L2, and the filter adds a load per token |
 | phase size (not kept) | 24 / 32 / 40 MB phases | container min 155 / 157 / 160 ms, medians within noise; peak 33.0 / 36.5 / 38.3 MiB; 32 MB kept |
 | v20 (not kept) | anchors recorded behind a branch (1 token in 150) instead of an unconditional store | no change |
+| **v21** = `main.cpp` | the lookup loop decides from k1 alone (1 = document id, 2 = over 32 bytes, bit 63 = 17–32 bytes) instead of reloading each token's start and end | scan 1796 → 1777 M cycles (min), 1882 → 1797 (median); same-batch container min / median: v18 175 / 220, v21 179 / 224, **v12 271 / 277** ms; 36.4 MiB |
+| 12 threads, native (v21) | timeline | setup 13–15 ms (query read 2, parse 1–3, intern 4, sample 3, plan 1.5), 8 stages of ~12 ms, build gap ~1 ms per phase, last answers 1.5 ms; 124–134 ms total |
 | single CPU, container | v16 vs the Rust program | 782 vs 539 ms: that program still does about 30 % less work in total |
 
 Row volume at full scale: 1.63 M rows and 1.42 M postings per phase (cold-term occurrences, duplicates included). Setup at 12 threads takes 15–25 ms locally: query parse 1–4 ms, interning 3–8 ms (page faults under WSL2 are slow; a longer barrier spin did not help), sample 2–3 ms, plan 1–2 ms. The Rust program's setup measured 10–15 ms on the same machine.
 
-## Current result and K estimate (v18)
+## Current result and K estimate (v21)
 
 | Measure | Value |
 |---|---|
-| Container wall (local, 12 CPUs, track Dockerfile) | 156–177 ms (v12 in an earlier batch: 233 / 340 min / median) |
+| Container wall (local, 12 CPUs) | min / median 179 / 224 ms in a batch where v12 took 271 / 277 (1.26–1.5× faster) |
 | Container `memory.peak` | 35–36.5 MiB (≈ 38 MB) |
-| S (official `static_axes.py`, cached tools image) | **932** (v16: 905) |
+| S (official `static_axes.py`, cached tools image) | **931** (v18: 932, v16: 905) |
 | D | 1 |
 
-If the board's time falls from v12's as much as single-thread work did (v12 ≈ 3.3 G cycles, v18 ≈ 2.2 G plus a much shorter setup), T would be about 0.15 s and K ≈ (56.352 / 0.15)^0.5 × 50^0.2 × (91 / 932)^0.15 ≈ 19.4 × 2.19 × 0.71 ≈ **30** (score ≈ 74). This is an estimate, not a result; the board decides. The goal of a score above 83 (K ≈ 46) would need T ≈ 0.065 s at this S. That is about twice as fast as the Rust program measured beside it, and is not reached.
+If the board's time falls from v12's by the same 1.26–1.5× as in the local container batch, T would be about 0.14–0.17 s; at 0.15 s and K ≈ (56.352 / 0.15)^0.5 × 50^0.2 × (91 / 931)^0.15 ≈ 19.4 × 2.19 × 0.71 ≈ **30** (score ≈ 74). This is an estimate, not a result; the board decides. The goal of a score above 83 (K ≈ 46) would need T ≈ 0.065 s at this S. That is about twice as fast as the Rust program measured beside it, and is not reached.
 
-## Correctness and packaging checks (v16, repeated for v18)
+## Correctness and packaging checks (v16, repeated for v18 and v21)
 
 - `dev-b/verify.py`, `dev-b/boundaries.py` (65,536 / 65,537 / 131,073 documents, which also forces phases to split below 65,536 documents) and `dev-b/extra.py`: all pass.
 - ASan + UBSan (`-fno-sanitize-recover`) on `extra.py`, `boundaries.py` and full seed 1; TSan on `extra.py`: all pass, no reports.
 - Fresh full-scale seed 2026: output identical to the reference (`bbd7e637…`).
-- v18: five consecutive full seed-1 runs give identical output; the track's Docker build gives the published hash.
+- v18 and v21: five consecutive full seed-1 runs give identical output; the track's Docker build gives the published hash at 35–36 MiB.
 
 ## Correctness and packaging checks (v12)
 
@@ -127,11 +129,11 @@ From `speed-demon-starter`, under Linux/WSL with the sibling `speed-demon-2026` 
 
 ```sh
 cd dev-b
-bash mk.sh v18.cpp v18 && bash mk.sh v18.cpp v18s -static
-SD_THREADS=12 python3 cmp.py 9 bin/v16 bin/v18      # interleaved, hash-checked
-bash dockcmp.sh 5 bin/v18s                            # board sandbox flags: wall + memory.peak
-python3 prof13.py v18.cpp bin/v18p.cpp && bash mk.sh bin/v18p.cpp v18p && SD_THREADS=12 bin/v18p /tmp/sd-track-b/data /tmp/sd-track-b/out   # phase timers
-python3 verify.py bin/v18 && python3 boundaries.py "$(realpath bin/v18)" && python3 extra.py bin/v18
+bash mk.sh v21.cpp v21 && bash mk.sh v21.cpp v21s -static
+SD_THREADS=12 python3 cmp.py 9 bin/v18 bin/v21      # interleaved, hash-checked
+bash dockcmp.sh 5 bin/v21s                            # board sandbox flags: wall + memory.peak
+python3 prof13.py v21.cpp bin/v21p.cpp && bash mk.sh bin/v21p.cpp v21p && SD_THREADS=12 bin/v21p /tmp/sd-track-b/data /tmp/sd-track-b/out   # phase timers
+python3 verify.py bin/v21 && python3 boundaries.py "$(realpath bin/v21)" && python3 extra.py bin/v21
 # v12 and earlier:
 bash mk.sh v12.cpp v12                 # release flags of the Dockerfile
 python3 cmp.py 9 bin/v12               # interleaved median, hash-checked
@@ -146,4 +148,4 @@ bash mk.sh v11.cpp v11p -DPROF && SD_THREADS=1 bin/v11p /tmp/sd-track-b/data /tm
 | Run ID | Commit | T (s) | Cgroup peak M | Official S / D | K | Gates |
 |---|---|---|---|---|---|---|
 | not noted (v12) | `4d0be41` | 0.217 | 41 MB | 802 / 1 | 25.42 (score 70.26) | passed |
-| pending (v16 `840e714`, then v18) | — | — | — | — | — | — |
+| pending (v16 `840e714`, v18 `735459a`, then v21) | — | — | — | — | — | — |

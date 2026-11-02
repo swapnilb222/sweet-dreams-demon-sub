@@ -442,13 +442,14 @@ struct Worker {
       for (U32 i = 0; i < ne; ++i) {
         if (i + PF < ne)
           _mm_prefetch((const char *)&t.b[t.home(H[i + PF])], _MM_HINT_T0);
-        if (K1[i] == 1) {
-          next_doc<SAMPLE>();
-          continue;
-        }
-        U32 n = E[i] - S[i];
-        U32 a = n <= 16 ? t.find(K1[i], H[i]) : n <= 32 ? t.slow(Key{0, K1[i]}, H[i], p + S[i], n) : 0;
-        token<SAMPLE>(a);
+        // k1: 1 = a document id, 2 = over 32 bytes, bit 63 = 17-32 bytes
+        if (U64 k1 = K1[i]; k1 - 1 < 2 || k1 >> 63) [[unlikely]] {
+          if (k1 == 1)
+            next_doc<SAMPLE>();
+          else
+            token<SAMPLE>(k1 == 2 ? 0 : t.slow(Key{0, k1}, H[i], p + S[i], E[i] - S[i]));
+        } else
+          token<SAMPLE>(t.find(k1, H[i]));
       }
       if (!SAMPLE)
         route();
