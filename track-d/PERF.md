@@ -25,8 +25,9 @@ Every step from the reference to the current version. Each step lists the live-b
 | 18 | The same program in 11 fewer lines | 53bbed8 | run-c9f3114356b5 | 0.089 | 58.2 | 589 | 33.48 | 76.19 |
 | 19 | Board test: fewer instructions in the search and the parser | 30bba3d | run-af7a78fbfbdb | 0.094 | 56.1 | 596 | 32.61 | 75.62 |
 | 20 | Step 18 again: step 19 reverted | a16b30e | run-3fc80c66055d | 0.088 | | 589 | | |
-| 21 | Step 19 again, retested in a quieter period | 55eeb87 | run-86a463aba615 | **0.086** | **58.5** | **596** | **33.72** | **76.40** |
-| 22 | Step 21 in 9 fewer lines | pending | pending | | | | | |
+| 21 | Step 19 again, retested in a quieter period | 55eeb87 | run-86a463aba615 | 0.086 | 58.5 | 596 | 33.72 | 76.40 |
+| 22 | Step 21 in 9 fewer lines | c09205a | run-0638cc93d96a | **0.086** | **58.9** | **587** | **33.76** | **76.42** |
+| 23 | Step 22 in 9 fewer lines | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -210,6 +211,16 @@ More statements written more simply, with the same instructions executed (295.4 
 - The edge count is a sum over each thread's part counts.
 
 All tests pass, including the stress runs, and it is 9 lines shorter: 580 locally.
+
+*Board result: 0.0864 s (run-0638cc93d96a, Track A at 1.09 times its best), with 587 lines: 76.42 points, our best so far. The other run, 0.0922 s (run-6266a5c0d81b), had Track A at 1.15 times its best.*
+
+### Step 23: more of the same
+- The helper that packed an edge with a heavy weight is gone. The parser already stores such an edge with an all-ones weight field, which is exactly what the helper rebuilt, so the build pass now just stores the word and records the weight in the escape table.
+- The worker hand-off `par()` is a single statement.
+- A claim that finds its node taken, and an exact claim, now share one test.
+- The reverse fill stores an edge and checks it for an escape in one statement.
+
+The sample input runs 296.1 million instructions, against 295.4 million: no measurable difference. All tests pass, including the stress runs, and it is 9 lines shorter: 571 locally.
 
 ---
 

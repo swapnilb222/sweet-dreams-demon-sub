@@ -40,21 +40,13 @@ static unsigned NT;
 static std::function<void(unsigned)> job;
 static std::barrier<> *gate;
 static void par(const std::function<void(unsigned)> &f) {
-  job = f;
-  gate->arrive_and_wait();
-  job(0);
-  gate->arrive_and_wait();
+  job = f, gate->arrive_and_wait(), job(0), gate->arrive_and_wait();
 }
 static u32 share(u32 n, unsigned t) { return u32(u64(n) * t / NT); }
 
 // Edge word: head in the low HB bits, weight above; an all-ones weight means
 // the real weight is in the slot's escape table.
 static u32 HB, HM, WM;
-static u32 pack(u32 v, u64 w, u32 slot, Esc &esc) {
-  if (w >= WM)
-    esc.push_back({slot, w});
-  return v | u32(std::min<u64>(w, WM)) << HB;
-}
 static u64 weight(u32 x, u32 slot, const Esc &esc) {
   u32 w = x >> HB;
   return w != WM ? w
@@ -222,8 +214,9 @@ static Csr read_graph(const std::string &path, u32 &n,
         for (auto &b : bins) {
           auto h = b.heavy[k].begin();
           b.each(k, [&](u32 x, uint16_t i) {
-            u32 s = cnt[i]++;
-            g.adj[s] = x >> HB == WM ? pack(x & HM, *h++, s, esc[t]) : x;
+            u32 s = cnt[i]++; // a heavy edge's weight field is all ones already
+            if ((g.adj[s] = x) >> HB == WM)
+              esc[t].push_back({s, *h++});
           });
         }
       }
@@ -261,8 +254,7 @@ static void reverse(const Csr &f, Csr &r, const std::vector<u32> &cut,
       at[v - lo] = s, s += r.off[v], r.off[v] = at[v - lo];
     auto put = [&](u32 v, u32 x, u32 e) {
       u32 s = at[v - lo]++;
-      r.adj[s] = x;
-      if (x >> HB == WM)
+      if ((r.adj[s] = x) >> HB == WM)
         esc[t].push_back({s, weight(x, e, f.esc)});
     };
     for (u32 u = lo; u < hi; ++u)
@@ -302,10 +294,8 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
   par([&](unsigned t) {
     auto claim = [&](u32 v) {
       u64 bit = u64(1) << (v & 63), w = taken[v >> 6].load(std::memory_order_relaxed);
-      if (w & bit)
-        return false;
-      if (exact)
-        return !(taken[v >> 6].fetch_or(bit, std::memory_order_relaxed) & bit);
+      if (w & bit || exact) // taken, or claimed exactly
+        return !(w & bit) && !(taken[v >> 6].fetch_or(bit, std::memory_order_relaxed) & bit);
       return taken[v >> 6].store(w | bit, std::memory_order_relaxed), true;
     };
     Region &r = reg[t];
