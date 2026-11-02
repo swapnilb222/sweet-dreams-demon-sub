@@ -71,7 +71,20 @@ static void merge(Esc &into, std::vector<Esc> &parts) {
 struct Csr {
   Buf<u32> off, adj;
   Esc esc;
+  u32 m = 0; // edges
 };
+// The raw graph has no offsets: node u owns the four slots from 4u, filled
+// from the first, or for more edges points to them in the spill area. So a
+// search step needs one cache miss instead of two. No edge word is all ones,
+// as heads stay below HM - 1.
+static constexpr u32 NONE = ~0u, SPILL = ~1u;
+static std::pair<u32, u32> row(const u32 *adj, u32 u) {
+  const u32 *x = adj + 4 * size_t(u);
+  if (x[0] == SPILL)
+    return {x[1], x[1] + x[2]};
+  return {4 * u, 4 * u + (x[0] != NONE) + (x[1] != NONE) + (x[2] != NONE) +
+                     (x[3] != NONE)};
+}
 
 // The file followed by zeros, so an 8-byte load at any byte stays mapped.
 static const char *map(const std::string &path, size_t &len) {
@@ -134,7 +147,7 @@ static Csr read_graph(const std::string &path, u32 &n,
   const char *text = map(path, size), *p = text;
   n = num(p);
   num(p);
-  HB = std::max(1, std::bit_width(n - 1));
+  HB = std::bit_width(n + 1);
   HM = (1u << HB) - 1, WM = ~0u >> HB;
   const u32 PB = 14, PM = (1u << PB) - 1, parts = (n - 1) / (PM + 1) + 1;
   auto cut = [&](unsigned t) { // thread t's first line
@@ -167,19 +180,16 @@ static Csr read_graph(const std::string &path, u32 &n,
       cur[k]->x[at[k]] = v | w << HB, cur[k]->lo[at[k]++] = uint16_t(u & PM);
     }
   });
-  std::vector<u32> base(parts + 1, 0);
-  for (u32 k = 0; k < parts; ++k) {
-    base[k + 1] = base[k];
-    for (auto &b : bins)
-      base[k + 1] += b.len[k];
-  }
+  Csr g;
+  for (auto &b : bins)
+    for (u32 k = 0; k < parts; ++k)
+      g.m += b.len[k];
   std::vector<u64> term((n >> 6) + 1);
   for (auto [s, t] : qs)
     term[s >> 6] |= u64(1) << (s & 63), term[t >> 6] |= u64(1) << (t & 63);
   bypass.assign(term.size(), 0);
-  Csr g;
-  g.off = buf<u32>(n + 1), g.adj = buf<u32>(base[parts]);
-  g.off[n] = base[parts];
+  g.adj = buf<u32>(size_t(4) * n + g.m);
+  std::atomic<u32> spilled{4 * n};
   std::vector<Esc> esc(NT);
   // One group of parts at a time; its bins are unmapped between groups, when
   // no other thread is faulting pages in (munmap stalls them all).
@@ -189,14 +199,22 @@ static Csr read_graph(const std::string &path, u32 &n,
     par([&](unsigned t) {
       std::vector<u32> cnt(PM + 1);
       for (u32 k; (k = next++) < end;) {
-        u32 lo = k << PB, len = std::min(n - lo, PM + 1), at = base[k];
+        u32 lo = k << PB, len = std::min(n - lo, PM + 1), extra = 0;
         std::fill(cnt.begin(), cnt.end(), 0);
         for (auto &b : bins)
           b.each(k, [&](u32, uint16_t i) { ++cnt[i]; });
+        for (u32 i = 0; i < len; ++i)
+          extra += cnt[i] > 4 ? cnt[i] : 0;
+        u32 pos = spilled.fetch_add(extra);
         for (u32 i = 0, u = lo; i < len; ++i, ++u) {
           bool skip = cnt[i] <= 2 && !(term[u >> 6] >> (u & 63) & 1);
           bypass[u >> 6] |= u64(skip) << (u & 63); // parts are word aligned
-          g.off[u] = at, at += cnt[i], cnt[i] = g.off[u];
+          u32 *x = &g.adj[4 * size_t(u)];
+          std::fill(x, x + 4, NONE);
+          if (cnt[i] > 4)
+            x[0] = SPILL, x[1] = pos, x[2] = cnt[i], cnt[i] = pos, pos += x[2];
+          else
+            cnt[i] = 4 * u;
         }
         for (auto &b : bins) {
           auto h = b.heavy[k].begin();
@@ -290,10 +308,10 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
     };
     Region &r = reg[t];
     r.ord.reserve(n / NT + n / NT / 4), r.deg.reserve(r.ord.capacity());
-    r.out = buf<u32>(g.off[n]);
+    r.out = buf<u32>(g.m);
     // Locals, so the stores into out cannot alias them.
     u32 *__restrict out = r.out.get(), j = 0;
-    const u32 *__restrict off = g.off.get(), *__restrict adj = g.adj.get();
+    const u32 *__restrict adj = g.adj.get();
     std::vector<u32> seeds;
     struct Walk {
       u32 slot, root, prev, at, steps;
@@ -314,7 +332,7 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
       auto visit = [&](u32 v) {
         if (r.ord.size() - blob < BLOB) {
           if (claim(v))
-            r.ord.push_back(v), __builtin_prefetch(&off[v]);
+            r.ord.push_back(v), __builtin_prefetch(&adj[4 * size_t(v)]);
         } else if (!(taken[v >> 6] >> (v & 63) & 1))
           seeds.push_back(v);
       };
@@ -328,17 +346,18 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
         hi = std::min(r.ord.size(), lo + BATCH);
         for (size_t i = lo; i < hi; ++i) {
           if (i + BATCH < r.ord.size())
-            __builtin_prefetch(&adj[off[r.ord[i + BATCH]]]);
+            __builtin_prefetch(&adj[row(adj, r.ord[i + BATCH]).first]);
           u32 from = j;
-          if (j + off[r.ord[i] + 1] - off[r.ord[i]] > off[n])
+          auto [first, last] = row(adj, r.ord[i]);
+          if (j + last - first > g.m)
             return void(full = true); // copies overran the edge buffer
-          for (u32 u = r.ord[i], e = off[u]; e < off[u + 1]; ++e) {
+          for (u32 u = r.ord[i], e = first; e < last; ++e) {
             u32 x = adj[e], v = x & HM;
             if (v == u)
               continue;
             if (skip(v)) // walked below; its slot is filled when it ends
               walks.push_back({j++, u, u, v, 0, weight(x, e, g.esc)}),
-                  __builtin_prefetch(&off[v]);
+                  __builtin_prefetch(&adj[4 * size_t(v)]);
             else
               put(j++, v, weight(x, e, g.esc)), visit(v);
           }
@@ -352,11 +371,11 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
         while (!walks.empty()) {
           size_t kept = 0;
           for (Walk &k : walks) // the offsets were fetched last round
-            __builtin_prefetch(&adj[off[k.at]]);
+            __builtin_prefetch(&adj[row(adj, k.at).first]);
           for (Walk k : walks) {
             u32 ahead = 0, next = 0, end = ~0u;
             u64 nw = 0;
-            for (u32 e = off[k.at]; e < off[k.at + 1]; ++e)
+            for (auto [e, end] = row(adj, k.at); e < end; ++e)
               if (u32 h = adj[e] & HM; h != k.prev && h != k.at)
                 ++ahead, next = h, nw = weight(adj[e], e, g.esc);
             if (ahead > 1)
@@ -367,7 +386,7 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
                      !skip(next) || ++k.steps == 64)
               end = next;
             if (end == ~0u)
-              __builtin_prefetch(&off[next]), walks[kept++] = k;
+              __builtin_prefetch(&adj[4 * size_t(next)]), walks[kept++] = k;
             else if (put(k.slot, end, k.w); end != k.root)
               visit(end);
           }
