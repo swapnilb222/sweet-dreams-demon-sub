@@ -25,7 +25,8 @@ Every step from the reference to the current version. Each step lists the live-b
 | 18 | The same program in 11 fewer lines | 53bbed8 | run-c9f3114356b5 | 0.089 | 58.2 | 589 | 33.48 | 76.19 |
 | 19 | Board test: fewer instructions in the search and the parser | 30bba3d | run-af7a78fbfbdb | 0.094 | 56.1 | 596 | 32.61 | 75.62 |
 | 20 | Step 18 again: step 19 reverted | a16b30e | run-3fc80c66055d | 0.088 | | 589 | | |
-| 21 | Step 19 again, retested in a quieter period | pending | pending | | | | | |
+| 21 | Step 19 again, retested in a quieter period | 55eeb87 | run-86a463aba615 | **0.086** | **58.5** | **596** | **33.72** | **76.40** |
+| 22 | Step 21 in 9 fewer lines | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -196,6 +197,19 @@ The query phase got about 1.5 ms faster in the per-phase timings, but our laptop
 *Board result: 0.0944 s (run-af7a78fbfbdb) and 0.1077 s (run-8fe3dcef2fc3), both slower than step 18. But the machine was noisy during these runs: our Track A code, unchanged in this push, ran 1.24 and 1.38 times slower than its own best in the same two runs. So this result cannot tell whether the change is slower. Step 20 goes back to step 18, the known-good version. Track A, whose code never changes between our pushes, works as a control from now on.*
 
 *Step 20 confirmed the noise: step 18's code ran at 0.0966 s and 0.0877 s, with Track A at 1.19 and 1.42 times its best. Step 21 retests step 19's code after the board had been idle for half an hour.*
+
+*Step 21 result: 0.0864 s (run-86a463aba615) with Track A at 1.01 times its best, so the machine was quiet. That is our best run, and faster than any run of step 18's code (best 0.0870 s). The other run, 0.0895 s (run-809644ef242e), had Track A at 1.18, so the machine was busy. We keep step 19's changes.*
+
+### Step 22: step 21 in fewer lines
+More statements written more simply, with the same instructions executed (295.4 million on the sample input, as before):
+
+- The search's queue type gets a short name, and the far-heap jump in `lower()` is a single assignment.
+- A new label page is set up in its return statement.
+- The solver's two early exits, for s equal to t and for an endpoint with no edges, share one test.
+- The query reader pushes each pair directly: C++ evaluates a braced list from left to right, so the two numbers are read in order.
+- The edge count is a sum over each thread's part counts.
+
+All tests pass, including the stress runs, and it is 9 lines shorter: 580 locally.
 
 ---
 

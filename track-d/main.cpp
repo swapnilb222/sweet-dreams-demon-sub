@@ -186,8 +186,7 @@ static Csr read_graph(const std::string &path, u32 &n,
   });
   Csr g;
   for (auto &b : bins)
-    for (u32 k = 0; k < parts; ++k)
-      g.m += b.len[k];
+    g.m += std::accumulate(b.len.begin(), b.len.end(), 0u);
   std::vector<u64> term((n >> 6) + 1);
   for (auto [s, t] : qs)
     term[s >> 6] |= u64(1) << (s & 63), term[t >> 6] |= u64(1) << (t & 63);
@@ -473,9 +472,8 @@ struct Side {
   };
   std::vector<Blk> blk;
   u32 head[NB], tail[NB], free = ~0u;
-  std::priority_queue<std::pair<u64, u32>, std::vector<std::pair<u64, u32>>,
-                      std::greater<>>
-      far;
+  using Far = std::pair<u64, u32>; // distance, node
+  std::priority_queue<Far, std::vector<Far>, std::greater<>> far;
   u64 cur = 0;
   Side(const Csr &c, u32 n)
       : g(c), dir((n >> PS) + 1), pool(buf<u64>(dir.size() * PG)) {
@@ -489,9 +487,7 @@ struct Side {
   }
   [[gnu::noinline]] u64 *page(u32 v) {
     u64 *p = dir[v >> PS] = &pool[used.size() * PG];
-    std::fill(p, p + PG, INF);
-    used.push_back(v >> PS);
-    return p;
+    return std::fill(p, p + PG, INF), used.push_back(v >> PS), p;
   }
   // Writes the entry either way and counts it only when `take`, so a
   // relaxation needs no unpredictable branch.
@@ -532,11 +528,9 @@ struct Side {
     u64 fb = far.empty() ? ~u64(0) : far.top().first >> SH, end = std::min(fb, cur + NB);
     while (cur < end && head[cur & (NB - 1)] == ~0u)
       ++cur;
-    if (cur == end) { // nothing in the ring before the far heap's first entry
-      if (far.empty())
-        return INF;
-      cur = fb;
-    }
+    if (cur == end && far.empty())
+      return INF;
+    cur = cur == end ? fb : cur; // nothing in the ring before the far heap's top
     for (; !far.empty() && (far.top().first >> SH) < cur + NB; far.pop())
       put((far.top().first >> SH) & (NB - 1), far.top().second);
     return cur << SH;
@@ -583,10 +577,8 @@ struct Solver {
   Solver(const Csr &fw, const Csr &rv, u32 n)
       : F(fw), R(rv), f(fw, n), b(rv, n) {}
   int64_t solve(u32 s, u32 t) {
-    if (s == t)
-      return 0;
-    if (F.off[s] == F.off[s + 1] || R.off[t] == R.off[t + 1])
-      return -1;
+    if (s == t || F.off[s] == F.off[s + 1] || R.off[t] == R.off[t + 1])
+      return s == t ? 0 : -1; // the same node, or no way out of s or into t
     b.clear(), f.start(s); // b not started yet: every backward label is INF
     u64 best = INF;
     size_t fs = 0, bs = 0;
@@ -624,10 +616,8 @@ int main(int argc, char **argv) {
     }).detach();
   size_t len;
   std::vector<std::pair<u32, u32>> qs;
-  for (const char *q = map(data + "/queries.txt", len), *e = q + len; q < e;) {
-    u32 s = num(q);
-    qs.push_back({s, num(q)});
-  }
+  for (const char *q = map(data + "/queries.txt", len), *e = q + len; q < e;)
+    qs.push_back({num(q), num(q)}); // a braced list is read left to right
   u32 n;
   std::vector<u64> bypass;
   Csr rev, fwd = read_graph(data + "/graph.txt", n, qs, bypass);
