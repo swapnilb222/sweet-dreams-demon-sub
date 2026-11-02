@@ -17,7 +17,7 @@ Dependency-free C++20, one pass over the corpus, and **no full index at any time
    - lists against bitmaps: bit tests;
    - bitmap against bitmap: word operations.
 
-   Results go into a tally per query (count, 64-bit sum, ten smallest ids). Phrase queries are one-term lookups. While the slower threads still scan phase k, the faster ones answer phase k − 1.
+   Results go into a tally per query (count, 64-bit sum, ten smallest ids); a bitmap result is counted and summed with AVX2 nibble tables. Phrase queries are one-term lookups. While the slower threads still scan phase k, the faster ones answer phase k − 1.
 5. **Output.** Phases are answered in order and each query's tally is updated by one thread at a time, so there are no atomics on results and the first ten ids need no merge. Threads format disjoint query ranges, written with one `write` each.
 
 Memory, 37.5 MiB cgroup peak at full scale:
@@ -43,7 +43,7 @@ Only the C++ standard library and Linux system calls. `dependency_count = 0`, so
 
 ## Validation and measurements
 
-See [PERF.md](PERF.md). Development sources (v1–v16), benchmark and test scripts live in [../dev-b](../dev-b), outside the scored folder. The canonical reference is `../../speed-demon-2026/reference/b_index.py`.
+See [PERF.md](PERF.md). Development sources (v1–v20), benchmark and test scripts live in [../dev-b](../dev-b), outside the scored folder. The canonical reference is `../../speed-demon-2026/reference/b_index.py`.
 
 ## With another 24 hours
 

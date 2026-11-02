@@ -113,8 +113,7 @@ struct alignas(64) Bucket {
   U32 act[5], meta, pad[2]; // meta: bits 0-3 = slot has k1, bit 8 = overflowed
 };
 static U64 hash_of(Key k) { // bijective in k0 when k1 = 0
-  U64 x = (k.k0 ^ k.k1 * 0x9E3779B97F4A7C15ULL) * 0xD6E8FEB86659FD93ULL;
-  return x ^ x >> 32;
+  return (k.k0 ^ k.k1 * 0x9E3779B97F4A7C15ULL) * 0xD6E8FEB86659FD93ULL;
 }
 struct Table {
   Bucket *b;
@@ -140,15 +139,15 @@ struct Table {
         return 0;
     }
   }
-  U32 find(Key k, U64 h) const { // a token of at most 16 bytes
+  U32 find(U64 k1v, U64 h) const { // a token of at most 16 bytes
     static const U64 zero = 0;
     U32 i = home(h);
     const Bucket &x = b[i];
     __m256i m = _mm256_cmpeq_epi64(_mm256_load_si256((const __m256i *)x.h), _mm256_set1_epi64x(h));
     U32 s = _tzcnt_u32(_mm256_movemask_pd(_mm256_castsi256_pd(m)) | 16), a = x.act[s];
-    bool ok = a && *(x.meta >> s & 1 ? &k1[i * 4 + s] : &zero) == k.k1;
+    bool ok = a && *(x.meta >> s & 1 ? &k1[i * 4 + s] : &zero) == k1v;
     if (!ok && (a || x.meta & 256)) [[unlikely]]
-      return slow(k, h, nullptr, 0);
+      return slow(Key{0, k1v}, h, nullptr, 0);
     return ok ? a : 0;
   }
 };
@@ -256,19 +255,47 @@ static U64 alnum_mask(const U8 *p) { // bit i: byte i is [A-Za-z0-9]
 // Positions of the set bits, base added; writes 16 slots even when fewer.
 static U32 flatten(U32 *o, U32 base, U64 bits) {
   U32 n = __builtin_popcountll(bits);
-  for (U32 i = 0; i < 16; ++i)
+  for (U32 i = 0; i < 12; ++i)
     o[i] = base + _tzcnt_u64(bits), bits = _blsr_u64(bits);
-  for (U32 i = 16; i < n; ++i)
+  for (U32 i = 12; i < n; ++i)
     o[i] = base + _tzcnt_u64(bits), bits = _blsr_u64(bits);
   return n;
 }
-static U32 bitsum(U64 w) { // sum of the positions of the set bits
-  return __builtin_popcountll(w & 0xAAAAAAAAAAAAAAAAULL) +
-         2 * __builtin_popcountll(w & 0xCCCCCCCCCCCCCCCCULL) +
-         4 * __builtin_popcountll(w & 0xF0F0F0F0F0F0F0F0ULL) +
-         8 * __builtin_popcountll(w & 0xFF00FF00FF00FF00ULL) +
-         16 * __builtin_popcountll(w & 0xFFFF0000FFFF0000ULL) +
-         32 * __builtin_popcountll(w & 0xFFFFFFFF00000000ULL);
+// The number of set bits in `words` words (a multiple of 4) and the sum of
+// their positions, 32 bytes at a time: per byte, its popcount and the sum of
+// its bit positions come from nibble tables; a byte's position in its word
+// is added as 8 * index * popcount, a word's as 64 * index * popcount.
+static void count_bits(const U64 *bits, U32 words, U64 &count, U64 &sum) {
+  auto table = [](const char *t) { return _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)t)); };
+  const __m256i ones = table("\0\1\1\2\1\2\2\3\1\2\2\3\2\3\3\4");
+  const __m256i places = table("\0\0\1\1\2\2\3\3\3\3\4\4\5\5\6\6");
+  const __m256i weights = _mm256_set1_epi64x(0x3830282018100800), low = _mm256_set1_epi8(15),
+                zero = _mm256_setzero_si256();
+  __m256i counts = zero, sums = zero, offsets = zero, starts = zero;
+  __m256i first = _mm256_setr_epi64x(0, 64, 128, 192);
+  for (U32 w = 0; w < words; w += 4) {
+    __m256i x = _mm256_loadu_si256((const __m256i *)(bits + w));
+    __m256i lo = _mm256_and_si256(x, low), hi = _mm256_and_si256(_mm256_srli_epi16(x, 4), low);
+    __m256i hi_ones = _mm256_shuffle_epi8(ones, hi);
+    __m256i per_byte = _mm256_add_epi8(_mm256_shuffle_epi8(ones, lo), hi_ones);
+    __m256i pos = _mm256_add_epi8(_mm256_add_epi8(_mm256_shuffle_epi8(places, lo), _mm256_shuffle_epi8(places, hi)),
+                                  _mm256_slli_epi16(hi_ones, 2)); // a high nibble's bits sit 4 higher
+    __m256i per_word = _mm256_sad_epu8(per_byte, zero);
+    counts = _mm256_add_epi64(counts, per_word);
+    sums = _mm256_add_epi64(sums, _mm256_sad_epu8(pos, zero));
+    starts = _mm256_add_epi64(starts, _mm256_mul_epu32(per_word, first));
+    offsets = _mm256_add_epi32(offsets, _mm256_madd_epi16(_mm256_maddubs_epi16(per_byte, weights), _mm256_set1_epi16(1)));
+    first = _mm256_add_epi64(first, _mm256_set1_epi64x(256));
+  }
+  auto total = [](__m256i v) { // every 32-bit half holds a non-negative count below 2^32
+    alignas(32) U32 l[8];
+    _mm256_store_si256((__m256i *)l, v);
+    U64 t = 0;
+    for (U32 x : l)
+      t += x;
+    return t;
+  };
+  count = total(counts), sum = total(sums) + total(starts) + total(offsets);
 }
 static bool has(const U16 *b, U32 n, U16 x) { // branch-free binary search
   if (!n)
@@ -387,8 +414,7 @@ struct Worker {
       g = g * 10 + p[i] - '0';
     doc = g - 1;
     static thread_local U32 S[BATCH / 2 + 80], E[BATCH / 2 + 80];
-    static thread_local U64 H[BATCH / 2 + 2];
-    static thread_local Key K[BATCH / 2 + 2];
+    static thread_local U64 H[BATCH / 2 + 2], K1[BATCH / 2 + 2];
     const Table t = tbl;
     U64 carry = 0;
     for (U32 pos = 0; pos < len;) {
@@ -404,8 +430,8 @@ struct Worker {
       }
       for (U32 i = 0; i < ne; ++i) {
         U32 n = E[i] - S[i];
-        K[i] = p[E[i]] == '\t' ? Key{0, 1} : n > 32 ? Key{0, 0} : make_key(p + S[i], n);
-        H[i] = hash_of(K[i]);
+        Key k = p[E[i]] == '\t' ? Key{0, 1} : n > 32 ? Key{0, 2} : make_key(p + S[i], n);
+        H[i] = hash_of(k), K1[i] = k.k1;
       }
       if (dn + ne >= db.size())
         db.resize(2 * (dn + ne)), an.resize(2 * (dn + ne));
@@ -416,12 +442,12 @@ struct Worker {
       for (U32 i = 0; i < ne; ++i) {
         if (i + PF < ne)
           _mm_prefetch((const char *)&t.b[t.home(H[i + PF])], _MM_HINT_T0);
-        if (K[i].k0 == 0 && K[i].k1 == 1) {
+        if (K1[i] == 1) {
           next_doc<SAMPLE>();
           continue;
         }
         U32 n = E[i] - S[i];
-        U32 a = n <= 16 ? t.find(K[i], H[i]) : n <= 32 ? t.slow(K[i], H[i], p + S[i], n) : 0;
+        U32 a = n <= 16 ? t.find(K1[i], H[i]) : n <= 32 ? t.slow(Key{0, K1[i]}, H[i], p + S[i], n) : 0;
         token<SAMPLE>(a);
       }
       if (!SAMPLE)
@@ -613,13 +639,10 @@ struct Worker {
       Tally &t = tal[q];
       U64 c = 0, s = 0;
       if (r.bits) {
-        for (U32 w = 0; w < wpb; ++w)
-          if (U64 x = r.bits[w]) {
-            U32 pc = __builtin_popcountll(x);
-            c += pc, s += U64(pc) * 64 * w + bitsum(x);
-            for (; x && t.count + c - pc < 10; x &= x - 1, --pc)
-              t.id[t.count + c - pc] = base + w * 64 + __builtin_ctzll(x);
-          }
+        count_bits(r.bits, wpb, c, s);
+        for (U32 w = 0, k = t.count; k < 10 && w < wpb; ++w)
+          for (U64 x = r.bits[w]; x && k < 10; x &= x - 1)
+            t.id[k++] = base + w * 64 + __builtin_ctzll(x);
       } else {
         for (U32 j = 0; j < r.n; ++j)
           s += r.ids[j];
