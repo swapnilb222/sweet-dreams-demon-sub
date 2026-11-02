@@ -12,6 +12,7 @@
 #include <barrier>
 #include <fcntl.h>
 #include <functional>
+#include <immintrin.h>
 #include <malloc.h>
 #include <numeric>
 #include <queue>
@@ -21,6 +22,7 @@
 
 using u32 = uint32_t;
 using u64 = uint64_t;
+using i64 = long long;
 using Esc = std::vector<std::pair<u32, u64>>; // slot -> weight too big to pack
 template <class T> using Buf = std::unique_ptr<T[]>;
 template <class T> static Buf<T> buf(size_t n) { return Buf<T>(new T[n]); }
@@ -38,7 +40,7 @@ static u32 share(u32 n, unsigned t) { return u32(u64(n) * t / NT); }
 
 // Edge word: head in the low HB bits, weight above; an all-ones weight means
 // the real weight is in the slot's escape table.
-static u32 HB, HM, WM;
+static u32 HB, HM, WM, LIM; // LIM: lighter edges take the search's fast path
 static u64 weight(u32 x, u32 slot, const Esc &esc) {
   u32 w = x >> HB;
   return w != WM ? w
@@ -103,9 +105,10 @@ static inline u32 num(const char *&p) {
   unsigned len = unsigned(std::countr_zero(stop)) / 8;
   p += len + 1;
   w = (w << (64 - 8 * len)) & 0x0F0F0F0F0F0F0F0Full;
-  w = (w * 10 + (w >> 8)) & 0x00FF00FF00FF00FFull;
-  w = (w * 100 + (w >> 16)) & 0x0000FFFF0000FFFFull;
-  return u32(w * 10000 + (w >> 32));
+  // Pairs, then quads, of digits in two multiply-adds.
+  __m128i x = _mm_maddubs_epi16(_mm_cvtsi64_si128(i64(w)), _mm_set1_epi16(0x010a));
+  x = _mm_madd_epi16(x, _mm_set1_epi32(0x00010064));
+  return u32(_mm_cvtsi128_si32(x)) * 10000 + u32(_mm_extract_epi32(x, 1));
 }
 
 // One thread's edges, filed by tail part in page-sized chunks. Each half of
@@ -135,6 +138,7 @@ static Csr read_graph(const std::string &path, u32 &n,
   const char *text = map(path, size), *p = text;
   n = num(p), num(p); // the edge count is not needed
   HB = std::bit_width(n + 1), HM = (1u << HB) - 1, WM = ~0u >> HB;
+  LIM = std::min(WM, (1022u << 6)); // the ring's reach: (NB - 2) buckets
   const u32 PB = 14, PM = (1u << PB) - 1, parts = (n - 1) / (PM + 1) + 1;
   auto cut = [&](unsigned t) { // thread t's first line
     const char *q = p + size_t(text + size - p) * t / NT;
@@ -475,7 +479,7 @@ struct Side {
   // relaxation needs no unpredictable branch.
   void put(u32 i, u32 v, bool take = true) {
     u32 t = tail[i];
-    if (t == ~0u || blk[t].n == BS) [[unlikely]]
+    if (blk[t].n == BS) [[unlikely]] // also an empty bucket's sentinel tail
       t = grow(i);
     blk[t].v[blk[t].n] = v, blk[t].n += take;
   }
@@ -487,10 +491,17 @@ struct Side {
     else
       b = u32(blk.size()), blk.emplace_back();
     blk[b].next = ~0u, blk[b].n = 0;
-    (t == ~0u ? head[i] : blk[t].next) = b;
+    (t == 0 ? head[i] : blk[t].next) = b;
     return tail[i] = b;
   }
   [[gnu::noinline]] void jump(u64 d, u32 v) { far.push({d, v}); }
+  // An edge too heavy for the ring's reach from the current bucket.
+  [[gnu::noinline]] u64 heavy(u64 d, u32 y, u32 e, const Side &o, u64 bst) {
+    u32 v = y & HM;
+    u64 nd = d + weight(y, e, g.esc), &dv = at(v), old = dv;
+    dv = std::min(nd, old), push(nd, v, nd < old);
+    return std::min(bst, nd + o.get(v));
+  }
   void push(u64 d, u32 v, bool take = true) {
     if ((d >> SH) - cur < NB)
       put((d >> SH) & (NB - 1), v, take);
@@ -500,8 +511,8 @@ struct Side {
   void clear() {
     for (u32 pg : used)
       dir[pg] = blank;
-    used.clear(), blk.clear();
-    std::fill(head, head + NB, ~0u), std::fill(tail, tail + NB, ~0u);
+    used.clear(), blk.assign(1, Blk{~0u, BS, {}}); // block 0: the sentinel
+    std::fill(head, head + NB, ~0u), std::fill(tail, tail + NB, 0);
     free = ~0u, far = {}, cur = 0;
   }
   void start(u32 s) { clear(), at(s) = 0, push(0, s); }
@@ -524,6 +535,7 @@ struct Side {
     size_t done = 0;
     // Locals, so the label and queue stores cannot alias them.
     const u32 *__restrict off = g.off.get(), *__restrict adj = g.adj.get();
+    const u32 hb = HB, hm = HM, lim = LIM; // the queue's u32 stores could alias the globals
     u64 bst = best;
     for (u32 x = head[i]; x != ~0u; x = blk[x].next)
       for (u32 k = 0; k < blk[x].n; ++k) {
@@ -538,14 +550,18 @@ struct Side {
           continue; // stale: u has since moved to an earlier bucket
         ++done;
         for (u32 e = off[u], end = off[u + 1]; e < end; ++e) {
-          u32 y = adj[e], v = y & HM;
-          u64 nd = d + weight(y, e, g.esc), &dv = at(v), old = dv;
-          dv = std::min(nd, old), push(nd, v, nd < old);
+          u32 y = adj[e], v = y & hm;
+          if (y >> hb >= lim) [[unlikely]] {
+            bst = heavy(d, y, e, o, bst);
+            continue;
+          }
+          u64 nd = d + (y >> hb), &dv = at(v), old = dv;
+          dv = std::min(nd, old), put((nd >> SH) & (NB - 1), v, nd < old);
           bst = std::min(bst, nd + o.get(v));
         }
       }
     best = bst;
-    blk[tail[i]].next = free, free = head[i], head[i] = tail[i] = ~0u;
+    blk[tail[i]].next = free, free = head[i], head[i] = ~0u, tail[i] = 0;
     return done;
   }
 };
@@ -618,7 +634,7 @@ int main(int argc, char **argv) {
   });
   FILE *file = fopen((out + "/distances.txt").c_str(), "wb");
   if (!file)
-    return 1;
+    _exit(1); // no output file: fail without unwinding
   for (int64_t a : ans)
     fprintf(file, "%lld\n", (long long)a);
   _exit(fclose(file) != 0); // a failed write shows here

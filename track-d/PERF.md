@@ -49,6 +49,7 @@ Each step is one push. A push is run once per team, so most steps have two board
 | 25 | Step 24 in 8 fewer lines (busy box: Track A 20% slow) | 5f88cb7 | run-0615a8689401 | 0.0854 | 58.4 | 579 | 34.08 | 76.63 |
 | 26 | Step 25 rerun, PERF.md only (quiet box: Track A normal) | 6d8a4be | run-b2d9282c5a33 | 0.0960 | 56.2 | 579 | 30.69 | 75.52 |
 | 27 | Back to step 23's code, minus the same 8 header lines (identical machine code; busy box: Track A 25% slow) | 35dca0f | run-a291b921cb21 | 0.0902 | 58.5 | 570 | 33.22 | 76.08 |
+| 28 | 7.8% fewer instructions: a fast path for light edges, a sentinel bucket tail, digits converted with SSE | see git log | | | | | | |
 
 ---
 
@@ -205,6 +206,17 @@ Our laptop has a 12 MB last-level cache, and the i5-13500 has 24 MB, so we check
 | Blob 32 nodes | the same as 64 |
 
 So the smaller laptop cache exaggerates memory costs by about 6%, but it did not mislead the big decisions: contraction is still clearly worth it on a 24 MB cache. The one promising size, 64-node blobs, lost 2 to 3 ms in two rounds of 20 interleaved wall-clock runs. The simulator counts misses but cannot see how many of them the processor overlaps, and smaller blobs restart the chain walks' prefetch pipeline more often. So we kept 512.
+
+## Step 28: fewer instructions for a fixed-clock CPU
+
+The board's 0.085 s for about 2.9 billion instructions means the six 2.5 GHz cores retire about two instructions per cycle each, across the whole run. So on the scoring machine the program is close to instruction-bound. On our laptop, which turbos to almost twice that clock, memory stalls looked like the bigger cost, and that view was misleading. Valgrind's per-line counts showed where the instructions go. The search's inner loop did about 50 per edge relaxed (18.7 million relaxations), and the parser about 108 per input line.
+
+Three changes, each with the same answers and the same memory accesses:
+- **A fast path for light edges.** An edge lighter than the ring's reach, which is every edge here except the 0.1% with escaped weights, cannot land outside the bucket ring when relaxed from the bucket being settled. So the ring-range check now runs only for heavy edges, out of line.
+- **A sentinel bucket tail.** Every empty bucket points at a permanently full block 0. One "is the tail block full?" test then covers both the full and the empty case.
+- **Digits converted with SSE.** The parser's three multiply-shift-mask steps per number became two instructions, `pmaddubsw` and `pmaddwd`, which x86-64-v3 includes.
+
+Together they cut the whole program's instructions by 7.8%, from 2.90 to 2.67 billion, with the simulated cache misses unchanged. On the laptop the change was even, as expected when turbo makes instructions cheap. Also, a missing output directory now ends with exit code 1 instead of a crash on the way out.
 
 ## How we measured
 
