@@ -440,17 +440,13 @@ static Csr reorder(Csr &&g, u32 &n, std::vector<std::pair<u32, u32>> &qs,
 
 // One search direction: a ring of distance buckets (far jumps wait in a heap)
 // and distances in pages materialized on first write, recycled per query.
-// Labels of type L saturate at NONE: a label below NONE is a real path's
-// length, so with 16-bit labels the pages are a quarter of the size and any
-// answer at or above NONE is rerun with 64-bit ones.
-template <class L> struct Side {
-  static constexpr u64 NONE = std::min<u64>(INF, L(~L(0)));
+struct Side {
   static constexpr unsigned SH = 6, NB = 1024, PS = 7, PG = 1u << PS, BS = 62;
   const Csr &g;
-  std::vector<L *> dir;
+  std::vector<u64 *> dir;
   std::vector<u32> used;
-  Buf<L> pool;
-  L blank[PG];
+  Buf<u64> pool;
+  u64 blank[PG];
   // Bucket entries live in blocks chained per bucket and recycled through a
   // free list, so memory follows the live queue, not each bucket's record.
   struct Blk {
@@ -462,19 +458,18 @@ template <class L> struct Side {
   std::priority_queue<Far, std::vector<Far>, std::greater<>> far;
   u64 cur = 0;
   Side(const Csr &c, u32 n)
-      : g(c), dir((n >> PS) + 1), pool(buf<L>(dir.size() * PG)) {
-    std::fill(blank, blank + PG, NONE), std::fill(dir.begin(), dir.end(), +blank);
+      : g(c), dir((n >> PS) + 1), pool(buf<u64>(dir.size() * PG)) {
+    std::fill(blank, blank + PG, INF), std::fill(dir.begin(), dir.end(), +blank);
     clear();
   }
-  const L *lab(u32 v) const { return dir[v >> PS] + (v & (PG - 1)); }
-  u64 get(u32 v) const { return *lab(v); }
-  L &at(u32 v) {
-    L *p = dir[v >> PS];
+  const u64 &get(u32 v) const { return dir[v >> PS][v & (PG - 1)]; }
+  u64 &at(u32 v) {
+    u64 *p = dir[v >> PS];
     return (p == blank ? page(v) : p)[v & (PG - 1)];
   }
-  [[gnu::noinline]] L *page(u32 v) {
-    L *p = dir[v >> PS] = &pool[used.size() * PG];
-    return std::fill(p, p + PG, NONE), used.push_back(v >> PS), p;
+  [[gnu::noinline]] u64 *page(u32 v) {
+    u64 *p = dir[v >> PS] = &pool[used.size() * PG];
+    return std::fill(p, p + PG, INF), used.push_back(v >> PS), p;
   }
   // Writes the entry either way and counts it only when `take`, so a
   // relaxation needs no unpredictable branch.
@@ -536,7 +531,7 @@ template <class L> struct Side {
         if (k + 8 < blk[x].n)
           __builtin_prefetch(&off[b[k + 8]]),
               __builtin_prefetch(&adj[off[b[k + 4]]]),
-              __builtin_prefetch(lab(b[k + 4]));
+              __builtin_prefetch(&get(b[k + 4]));
         u32 u = b[k];
         u64 d = get(u);
         if (d >> SH != cur)
@@ -544,9 +539,8 @@ template <class L> struct Side {
         ++done;
         for (u32 e = off[u], end = off[u + 1]; e < end; ++e) {
           u32 y = adj[e], v = y & HM;
-          L &dv = at(v);
-          u64 nd = d + weight(y, e, g.esc), old = dv;
-          dv = L(std::min(nd, old)), push(nd, v, nd < old);
+          u64 nd = d + weight(y, e, g.esc), &dv = at(v), old = dv;
+          dv = std::min(nd, old), push(nd, v, nd < old);
           bst = std::min(bst, nd + o.get(v));
         }
       }
@@ -558,23 +552,22 @@ template <class L> struct Side {
 
 // Forward alone for short queries, then bidirectional, growing the side that
 // has settled less; stops once the two lower bounds reach the best meeting.
-// Returns the distance, or NONE or more if there is no path below NONE.
-template <class L> struct Solver {
+struct Solver {
   static constexpr size_t PROBE = 256;
   const Csr &F, &R;
-  Side<L> f, b;
+  Side f, b;
   Solver(const Csr &fw, const Csr &rv, u32 n)
       : F(fw), R(rv), f(fw, n), b(rv, n) {}
-  u64 solve(u32 s, u32 t) {
+  int64_t solve(u32 s, u32 t) {
     if (s == t || F.off[s] == F.off[s + 1] || R.off[t] == R.off[t + 1])
-      return s == t ? 0 : INF; // the same node, or no way out of s or into t
-    b.clear(), f.start(s); // b not started yet: every backward label is NONE
+      return s == t ? 0 : -1; // the same node, or no way out of s or into t
+    b.clear(), f.start(s); // b not started yet: every backward label is INF
     u64 best = INF;
     size_t fs = 0, bs = 0;
     while (fs < PROBE) {
       u64 lf = f.lower(), dt = f.get(t);
       if (dt <= lf || lf == INF)
-        return dt;
+        return dt >= INF ? -1 : int64_t(dt);
       fs += f.drain(b, best);
     }
     b.start(t), best = f.get(t);
@@ -587,7 +580,7 @@ template <class L> struct Solver {
       else
         bs += b.drain(f, best);
     }
-    return best;
+    return best >= INF ? -1 : int64_t(best);
   }
 };
 
@@ -619,15 +612,9 @@ int main(int argc, char **argv) {
   std::atomic<size_t> next{0};
   par([&](unsigned) {
     // Never freed: unmapping while other threads search would stall them.
-    Solver<uint16_t> &narrow = *new Solver<uint16_t>(fwd, rev, n);
-    Solver<u64> *wide = nullptr; // made on first need
-    for (size_t k; (k = next++) < qs.size();) {
-      auto [s, t] = qs[order[k]];
-      u64 d = narrow.solve(s, t);
-      if (d >= Side<uint16_t>::NONE)
-        d = (wide ? wide : wide = new Solver<u64>(fwd, rev, n))->solve(s, t);
-      ans[order[k]] = d >= INF ? -1 : int64_t(d);
-    }
+    Solver &solver = *new Solver(fwd, rev, n);
+    for (size_t k; (k = next++) < qs.size();)
+      ans[order[k]] = solver.solve(qs[order[k]].first, qs[order[k]].second);
   });
   FILE *file = fopen((out + "/distances.txt").c_str(), "wb");
   if (!file)
