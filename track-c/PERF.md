@@ -16,11 +16,12 @@ Local numbers (in the notes) were measured on a laptop (Intel Core Ultra 7 265U,
 | 7 | Batched structural scan: carry-less multiply turns the quote mask into an inside-quotes mask, so every record is five structural offsets with no branch on field shape; AES name hash over a masked 32-byte load (no byte loop); 8-slot cache-line buckets holding tag + dense 17-bit number (local, 1 thread: 127 ms; slower than step 6 until steps 8–9) | | | | |
 | 8 | Always-8 offset stores (no mispredicted loop exit per 64-byte block); hot pointers copied out of the lambda's captures into registers; per-block quote rank instead of a quote count per offset; digits decoded four records at a time with `maddubs`/`madd` (local, 1 thread: 127 → 91 ms) | | | | |
 | 9 | Threads spawned as a tree before any page is faulted (a page fault was holding up thread creation for ~1.5 ms); shared tables on 3 transparent huge pages; input prefetched 4 KB ahead (1 thread: 91 → 85 ms); `-march=raptorlake` for the scoring box's i5-13500; code reorganised and compacted, S = 462 → 207 lines (local, 12 threads: ~20–23 ms, board-style M 11.2 MB) | (commit 0a20695) | 0.023 | 11 | 82.87 (K 45.43, S 213) |
-| 10 | Memory 11 → 8.9 MB (board-style `memory.peak`): bucket table halved to 1 MiB (8-slot buckets at 76% load; spills take the slow path); bitset laid out `[name / 64][group]` with one column per country present, so it grows with the names seen (~3 MiB) instead of a fixed 4 MiB; the two huge pages hold only buckets + bitset head (all used), and nobody else touches them while they fault (racing THP faults each charged a 2 MiB page: +4–8 MB peak); commas and LFs found with one `pshufb` lookup; distinct names by popcount after parsing (no stores between the locked ORs); smaller per-thread arrays; the last T MiB claimed in 256 KiB pieces; fixed a latent bug (a fresh block of name numbers looked used up, so spilled lookups wasted numbers). Local, 12 threads: ~21 ms, unchanged | | | | |
+| 10 | Memory 11 → 8.9 MB (board-style `memory.peak`): bucket table halved to 1 MiB (8-slot buckets at 76% load; spills take the slow path); bitset laid out `[name / 64][group]` with one column per country present, so it grows with the names seen (~3 MiB) instead of a fixed 4 MiB; the two huge pages hold only buckets + bitset head (all used), and nobody else touches them while they fault (racing THP faults each charged a 2 MiB page: +4–8 MB peak); commas and LFs found with one `pshufb` lookup; distinct names by popcount after parsing (no stores between the locked ORs); smaller per-thread arrays; the last T MiB claimed in 256 KiB pieces; fixed a latent bug (a fresh block of name numbers looked used up, so spilled lookups wasted numbers). Local, 12 threads: ~21 ms, unchanged | (commit f984f5b) | 0.024 | 9 | 83.17 (K 46.06, S 220) |
+| 11 | Batches of 16 blocks (1 KiB) instead of 32: per-thread batch arrays shrink from ~37 to ~20 KiB, because the box runs two threads per core on a shared 48 KiB L1; input pages dropped once per 4 MiB region by the thread finishing its last piece (a quarter of the `MADV_DONTNEED` calls, each a TLB-shootdown IPI to every core running the process). Local, 12 threads: CPU 279 → 256 ms (median of 5 interleaved rounds), board-style M 8.7 MB, S 221 | | | | |
 
 ## How the numbers were taken
 
-Tools live in `speed-demon-starter/dev-c` (every version `v4.cpp` … `v23.cpp` is kept there).
+Tools live in `speed-demon-starter/dev-c` (every version `v4.cpp` … `v25.cpp` is kept there).
 
 - `bench.sh rounds img...`: interleaved rounds of 10 runs of each image, pinned to 12 CPUs (`CPUS=2` for one thread). `runner.c` reports min/median wall, CPU, system time and peak RSS.
 - `mem.sh img...`: the board's M. It warms `/data` into the page cache from another container first, as the harness's `prewarm` does, then reads the run's cgroup `memory.peak`. Page-cache pages of the input are charged elsewhere, so M is anonymous memory plus the container's own ~5.4 MB floor.
@@ -58,3 +59,27 @@ Tried and dropped:
 - Name interning plus the bitset footprint: 20–25%, measured by knocking each stage out (the output is then wrong).
 
 Board arithmetic, with K = (T_ref/T)^0.5 × (M_ref/M)^0.2 × (S_ref/S)^0.15: at M = 9 MB and S ≈ 220, 86 points needs T ≈ 19 ms.
+
+## Research-guided experiment: partitioned distinct-name bitset (v24, dropped)
+
+The literature on parallel aggregation says contended atomics on shared random data scale badly. The fix it gives is to partition by key, so that each partition's owner updates privately:
+- **Privatization and partitioning:** Cieslewicz & Ross, *Adaptive Aggregation on Chip Multiprocessors*, VLDB 2007; Ye et al., *Scalable aggregation on multicore processors* (PLAT), DaMoN 2011; Kirk & Hwu on privatization of atomics.
+- **Owner caches and batched messages:** Metreveli et al., *CPHash: a cache-partitioned hash table*, PPoPP 2012. Each core owns a slice of the table, and lookups reach it as batched messages.
+- **Partitioning through cache-sized buffers:** Polychroniou & Ross, SIGMOD 2014; Balkesen et al., VLDB 2013.
+- **Shared tables:** Xue et al., *Global Hash Tables Strike Back!*, 2025, find that a purpose-built shared table can match partitioning.
+
+How v24 applied this:
+- Each cache line of the bitset gets an owning thread, chosen by hash.
+- Senders append bit indices to a 1024-entry ring per (sender, owner) pair, published every 16 batches.
+- Owners apply them with plain ORs into their ~256 KiB share, which fits in L2. There are no atomics on the bitset.
+
+Result:
+- **Correct** on every dataset.
+- **Single thread:** within noise of v23.
+- **12 threads:** worse, with a median of 70–97 ms. Whenever a thread fell ~1.6 ms behind (descheduled, which happens on a shared host), every sender's ring to it filled and the senders stalled (2–5 × 10^5 full-ring polls per run).
+- **Clean run:** ~21 ms, the same as v23.
+- **Memory:** about +1 MB of rings.
+
+Knocking out the atomic OR showed why: it is only ~5% of 12-thread time. Most of the cost is the three random table lines per record and the input stream, which partitioning does not remove. Xue et al. reach the same conclusion: for a single shared structure tuned to the task, partitioning does not pay. Dropped.
+
+Also measured, all within noise locally: batches of 8, 16 and 32 blocks; ring publish intervals.

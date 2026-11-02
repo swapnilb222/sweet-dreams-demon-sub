@@ -1,4 +1,4 @@
-// Speed Demon 2026, Track C (Join). v23.
+// Speed Demon 2026, Track C (Join). v25.
 //
 // Threads: one per CPU, spawned as a tree before anyone faults memory in
 // (a page fault can hold up the mmap lock that creating a thread needs). They
@@ -7,7 +7,8 @@
 // piece starts at its first record start: by spec 2.2 an LF inside quotes is
 // followed by [a-z"], so an LF followed by a digit or a BOM byte starts one.
 //
-// A piece is walked in batches of 2 KiB, in passes:
+// A piece is walked in batches of 1 KiB (two hyperthreads share a core's
+// 48 KiB L1, so each keeps its batch arrays small), in passes:
 //  1. Structure. Per 64 bytes, AVX2 masks of quotes, commas and LFs; a
 //     carry-less multiply of the quote mask by all ones gives the
 //     inside-quotes mask ("" toggles twice, so escapes need no care). Every
@@ -61,6 +62,7 @@ static u64 len, rlen, nreg, T, ngroups, G;
 static unsigned char *group_of;
 static atomic<u64> *buckets, *seen, next_piece, next_number;
 static atomic<unsigned char> code_group[17576];
+static atomic<u64> parsed[1024]; // bytes parsed per 4 MiB region of records.csv
 static mutex mu;
 static barrier<> *sync_all;
 static Tot all[256];
@@ -135,9 +137,10 @@ static void work(int t, int span) {
   const u64 lo = 0x8080808080808080, hi = 0x8080802C800A8080;
   const V sep = _mm256_set_epi64x(hi, lo, hi, lo);
   const __m128i ones = _mm_set1_epi8(-1);
-  unsigned pos[1280], qb[64], nm[3][260];
-  u64 qm[64], dg[3][260], hs[256], lens[256], spare = 0;
-  long sg[256];
+  constexpr int NB = 16, NR = NB * 64 / 11 + 8; // records per batch at most (+4 for SIMD decode)
+  unsigned pos[NB * 64 + 16], qb[64], nm[3][NR];
+  u64 qm[64], dg[3][NR], hs[NR], lens[NR], spare = 0;
+  long sg[NR];
   for (u64 claim = next_piece, size; claim < len;) {
     // 1 MiB pieces; the last T MiB in quarters, so the threads finish together.
     if (!next_piece.compare_exchange_weak(claim, claim + (size = claim + T * PIECE < len ? PIECE : PIECE / 4))) continue;
@@ -148,7 +151,7 @@ static void work(int t, int span) {
     auto rank = [&](u64 p) { return qb[(p - origin) / 64 % 64] + POP(_bzhi_u64(qm[(p - origin) / 64 % 64], (p - origin) % 64)); };
     while (rec < end) {
       // 1. structure
-      for (int s = 0; s < 32; ++s, at += 64) {
+      for (int s = 0; s < NB; ++s, at += 64) {
         _mm_prefetch(in + at + 4096, _MM_HINT_T0);
         V a = LD(in + at), b = LD(in + at + 32);
         u64 q = EQ64(a, b, '"'), blk = (at - origin) / 64 % 64;
@@ -200,7 +203,10 @@ static void work(int t, int span) {
       filled -= n * 5;
       memmove(pos, pos + n * 5, filled * 4);
     }
-    madvise((void *)(in + claim), end - claim, MADV_DONTNEED);
+    // The last piece of a 4 MiB region drops its pages: a quarter of the
+    // calls, and each one interrupts every core running this process.
+    if (u64 r = claim >> 22; parsed[r].fetch_add(end - claim) + end - claim == min(len - (r << 22), 1ul << 22))
+      madvise((void *)(in + (r << 22)), min(len - (r << 22), 1ul << 22), MADV_DONTNEED);
     claim = next_piece;
   }
   // Distinct names per group: popcounts of this thread's share of the words.
