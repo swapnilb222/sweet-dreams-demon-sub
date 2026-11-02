@@ -1,4 +1,4 @@
-// Speed Demon 2026, Track C (Join). v28.
+// Speed Demon 2026, Track C (Join). v29: v27 with one thread per physical core.
 //
 // Threads: one per CPU in the affinity mask. They parse regions.csv in T
 // slices into a direct table region_id -> group (0 = unmatched), meet at a
@@ -130,9 +130,7 @@ static void work(u64 t) {
         // Commas and LFs: bytes equal to the table entry their low nibble picks.
         u64 m = (SEP(a) | SEP(b) << 32) & ~ins, k = POP(m);
         inside = (long)ins >> 63, qm[blk] = q, qb[blk] = quotes, quotes += POP(q);
-#pragma GCC unroll 8
-        for (u64 j = 0; j < 8; ++j, m &= m - 1) pos[filled + j] = at + _tzcnt_u64(m);
-        for (u64 j = 8; m; ++j, m &= m - 1) pos[filled + j] = at + _tzcnt_u64(m);
+        for (u64 j = 0; j < 8 || m; ++j, m &= m - 1) pos[filled + j] = at + _tzcnt_u64(m);
         filled += k;
       }
       // 2. numbers of the records that start in this piece
@@ -183,7 +181,9 @@ static void work(u64 t) {
 
 int main() {
   cpu_set_t cs;
-  sched_getaffinity(0, sizeof cs, &cs), T = CPU_COUNT(&cs);
+  // One thread per core: the box runs 12 CPUs as 6 cores x 2 hyperthreads, and
+  // two threads of this loop on one core share its L1 and fill buffers.
+  sched_getaffinity(0, sizeof cs, &cs), T = max(1, CPU_COUNT(&cs) / 2);
   memset(keep, -1, 32), in = open_map("/data/records.csv", len);
   rg = open_map("/data/regions.csv", rlen);
   // Regions are listed in ascending id order: the last line has the largest.
@@ -211,4 +211,5 @@ int main() {
     fprintf(out, " %ld %ld %ld\n", a[6], a[3] & 0xFFFFFFFF, a[3] >> 32);
   }
   fclose(out);
+  _exit(0);
 }
