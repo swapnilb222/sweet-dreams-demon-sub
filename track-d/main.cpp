@@ -9,6 +9,7 @@
 //    in pages handed out on first touch.
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <bit>
 #include <cstdio>
 #include <cstdint>
@@ -37,26 +38,12 @@ static constexpr u32 BLOB = 512, BATCH = 8;
 // Persistent workers: thread start-up per phase would cost milliseconds.
 static unsigned NT;
 static std::function<void(unsigned)> job;
-// A barrier that spins briefly before sleeping: most waits are short, and a
-// core woken from a deep idle state needs tens of microseconds to resume.
-static std::atomic<unsigned> arrived{0}, phase{0};
-static void meet() {
-  unsigned p = phase.load(std::memory_order_acquire);
-  if (arrived.fetch_add(1, std::memory_order_acq_rel) == NT - 1) {
-    arrived.store(0, std::memory_order_relaxed);
-    phase.fetch_add(1, std::memory_order_release), phase.notify_all();
-    return;
-  }
-  for (int i = 0; i < 2000 && phase.load(std::memory_order_acquire) == p; ++i)
-    __builtin_ia32_pause();
-  while (phase.load(std::memory_order_acquire) == p)
-    phase.wait(p, std::memory_order_acquire);
-}
+static std::barrier<> *gate;
 static void par(const std::function<void(unsigned)> &f) {
   job = f;
-  meet();
+  gate->arrive_and_wait();
   job(0);
-  meet();
+  gate->arrive_and_wait();
 }
 static u32 share(u32 n, unsigned t) { return u32(u64(n) * t / NT); }
 
@@ -635,10 +622,11 @@ int main(int argc, char **argv) {
   std::string data = argc > 2 ? argv[1] : "/data",
               out = argc > 2 ? argv[2] : "/out";
   NT = std::clamp(std::thread::hardware_concurrency(), 1u, 12u);
+  gate = new std::barrier<>(NT);
   for (unsigned t = 1; t < NT; ++t)
     std::thread([t] {
       for (;;)
-        meet(), job(t), meet();
+        gate->arrive_and_wait(), job(t), gate->arrive_and_wait();
     }).detach();
   size_t len;
   std::vector<std::pair<u32, u32>> qs;
