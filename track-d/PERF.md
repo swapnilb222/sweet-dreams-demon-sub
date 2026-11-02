@@ -5,7 +5,7 @@
 | | T (s) | M (MB) | Lines | K | Points |
 |---|---:|---:|---:|---:|---:|
 | Python reference | 72.69 | 893 | 43 | 1.00 | 0.00 |
-| Our best board run (step 23, commit 640d57d) | **0.0856** | **57.9** | **578** | **34.12** | **76.65** |
+| Our best board run (step 28, commit b82aadb) | **0.0849** | **56.6** | **586** | **34.33** | **76.78** |
 
 That is about **850 times faster** than the reference, with **15 times less memory**. Most of the speed came from three ideas:
 - making the graph smaller by contracting chains of pass-through nodes;
@@ -49,7 +49,7 @@ Each step is one push. A push is run once per team, so most steps have two board
 | 25 | Step 24 in 8 fewer lines (busy box: Track A 20% slow) | 5f88cb7 | run-0615a8689401 | 0.0854 | 58.4 | 579 | 34.08 | 76.63 |
 | 26 | Step 25 rerun, PERF.md only (quiet box: Track A normal) | 6d8a4be | run-b2d9282c5a33 | 0.0960 | 56.2 | 579 | 30.69 | 75.52 |
 | 27 | Back to step 23's code, minus the same 8 header lines (identical machine code; busy box: Track A 25% slow) | 35dca0f | run-a291b921cb21 | 0.0902 | 58.5 | 570 | 33.22 | 76.08 |
-| 28 | 7.8% fewer instructions: a fast path for light edges, a sentinel bucket tail, digits converted with SSE | see git log | | | | | | |
+| 28 | 7.8% fewer instructions: a fast path for light edges, a sentinel bucket tail, digits converted with SSE | b82aadb | run-563b7cbbe53a | **0.0849** | **56.6** | **586** | **34.33** | **76.78** |
 
 ---
 
@@ -216,7 +216,9 @@ Three changes, each with the same answers and the same memory accesses:
 - **A sentinel bucket tail.** Every empty bucket points at a permanently full block 0. One "is the tail block full?" test then covers both the full and the empty case.
 - **Digits converted with SSE.** The parser's three multiply-shift-mask steps per number became two instructions, `pmaddubsw` and `pmaddwd`, which x86-64-v3 includes.
 
-Together they cut the whole program's instructions by 7.8%, from 2.90 to 2.67 billion, with the simulated cache misses unchanged. On the laptop the change was even, as expected when turbo makes instructions cheap. Also, a missing output directory now ends with exit code 1 instead of a crash on the way out.
+Together they cut the whole program's instructions by 7.8%, from 2.90 to 2.67 billion, with the simulated cache misses unchanged. On the laptop the change was even, as expected when turbo makes instructions cheap. On the board, with Track A at its normal time, it ran 0.0849 s, our best yet.
+
+Two follow-ups did not help. Copying the size globals into locals in the parser and the row builder saved only 0.1%, because the compiler had already kept them in registers. Storing both directions' labels side by side in shared pages, so that a relaxation reads the other side's label from the line it writes, cost 4% more instructions and 8% more L1 misses. The pages became twice as large, and filling them cost more than the shared line saved. Also, a missing output directory now ends with exit code 1 instead of a crash on the way out.
 
 ## How we measured
 
