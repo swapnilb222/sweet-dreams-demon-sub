@@ -50,6 +50,8 @@ Each step is one push. A push is run once per team, so most steps have two board
 | 26 | Step 25 rerun, PERF.md only (quiet box: Track A normal) | 6d8a4be | run-b2d9282c5a33 | 0.0960 | 56.2 | 579 | 30.69 | 75.52 |
 | 27 | Back to step 23's code, minus the same 8 header lines (identical machine code; busy box: Track A 25% slow) | 35dca0f | run-a291b921cb21 | 0.0902 | 58.5 | 570 | 33.22 | 76.08 |
 | 28 | 7.8% fewer instructions: a fast path for light edges, a sentinel bucket tail, digits converted with SSE | b82aadb | run-563b7cbbe53a | **0.0849** | **56.6** | **586** | **34.33** | **76.78** |
+| 29 | Board test: 32-bit labels with an exact 64-bit rerun, both solvers made up front (busy box: Track A 23% slow; reverted) | fca0435 | run-f8bbe97d57d7 | 0.0945 | 56.2 | 596 | 30.97 | 75.60 |
+| 30 | Back to step 28's code for the freeze | see git log | | | | 586 | | |
 
 ---
 
@@ -219,6 +221,9 @@ Three changes, each with the same answers and the same memory accesses:
 Together they cut the whole program's instructions by 7.8%, from 2.90 to 2.67 billion, with the simulated cache misses unchanged. On the laptop the change was even, as expected when turbo makes instructions cheap. On the board, with Track A at its normal time, it ran 0.0849 s, our best yet.
 
 Three follow-ups did not help. Copying the size globals into locals in the parser and the row builder saved only 0.1%, because the compiler had already kept them in registers. Storing both directions' labels side by side in shared pages, so that a relaxation reads the other side's label from the line it writes, cost 4% more instructions and 8% more L1 misses. The pages became twice as large, and filling them cost more than the shared line saved. A third follow-up gave each bucket a raw write pointer into 256-byte-aligned blocks, so that a push needs no block count. It was correct on every test but within 0.6% of step 28's instruction count, because the compiler had already made the old push nearly as cheap, so we left it out. Also, a missing output directory now ends with exit code 1 instead of a crash on the way out.
+
+### Step 29: 32-bit labels, tried and reverted
+32-bit labels kept the instruction count the same, and with the target's caches they cut the L1 misses by 10%. Both solvers were made before the query phase, to rule out the allocation during the search that we suspected in steps 24 to 26. The one board run came on a busy box (Track A 23% slow) at 0.0945 s. Across all narrow-label versions, three of five board runs were slow. The final score is the middle three of five runs, so we froze on step 28's code.
 
 ## How we measured
 
