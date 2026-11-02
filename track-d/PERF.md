@@ -21,8 +21,9 @@ Every step from the reference to the current version. Each step lists the live-b
 | 14 | Board test: the reverse graph in 2 MiB pages | 99aef00 | run-719b42059767 | 0.089 | 57.4 | 622 | 33.15 | 76.03 |
 | 15 | Step 11 again: step 14 reverted | f09ad57 | run-4590a0e90760 | **0.087** | **58.0** | **600** | **33.63** | **76.34** |
 | 16 | Board test: a barrier that spins briefly before sleeping | 67069f8 | run-8755815cfc16 | 0.087 | 58.1 | 610 | 33.57 | 76.27 |
-| 17 | Step 11 again: step 16 reverted | 89b85fd | not run separately | | | | | |
-| 18 | The same program in 11 fewer lines | pending | pending | | | | | |
+| 17 | Step 11 again: step 16 reverted | 89b85fd | run-98427ea1df21 | 0.089 | 58.8 | 600 | 33.31 | 76.09 |
+| 18 | The same program in 11 fewer lines | 53bbed8 | run-c9f3114356b5 | 0.089 | 58.2 | 589 | 33.48 | 76.19 |
+| 19 | Board test: fewer instructions in the search and the parser | pending | pending | | | | | |
 
 Step 6 ran slower on the board than step 5 (0.113 s and 0.118 s in its two runs, against 0.110 s), even though it was faster on our machine. Step 7 removes the two parts of it that behave differently on the board's kernel. From the reference to step 5: about **660x faster**, **16x less memory**, and K from 1 to 30.4.
 
@@ -178,6 +179,17 @@ Line count is the one part of the score that does not vary from run to run, so w
 - A few short setup statements share a line, and the output checks for a failed write once, when the file is closed.
 
 Instruction counts on the sample input confirm the program does the same work (310.3 million instructions, against 311.0 million before). All tests pass, and it is 11 lines shorter: 582 locally.
+
+*Board result: 0.0885 s (run-c9f3114356b5) and 0.0889 s (run-c052275c3715), with 589 lines. Six board runs of step 11's code now average 0.0888 s, so the speed is the same, as intended.*
+
+### Step 19 (board test): fewer instructions in the hot loops
+Valgrind's instruction counts show the search's bucket drain running about half of all instructions. Three changes cut the board build's total by 4.8% (295 million instructions on the sample input, against 310 million):
+
+- **Rare paths out of line.** Growing a bucket by a block, a jump to the far heap, and a new label page are rare. Inlined, they made the compiler keep their values in registers too, so the hot loop spilled its own values to the stack. Now they are separate functions.
+- **No queue counter.** Each push and each drained entry updated a count of queued entries, used only to tell when the ring of buckets is empty. The search now finds that out by scanning the ring when it looks for the next bucket. It already scanned there, so this costs at most one full pass when a search runs dry.
+- **Simpler parser bookkeeping.** The parser no longer counts each part's edges with a division by the chunk size per edge. The counts follow from the chunks at the end.
+
+The query phase got about 1.5 ms faster in the per-phase timings, but our laptop's full timings were level. Its cores and clock differ from the scoring machine's, so the board decides. It is 7 lines longer. We keep it only if both board runs beat step 18's.
 
 ---
 
