@@ -1,10 +1,10 @@
 # Track B: performance log
 
-## Status: local profiling, 2026-11-01
+## Status: 2026-11-02
 
-Implemented and tested locally. **No live-board submission was made, and no official run ID, K, or points are claimed.** Add the actual run IDs and cgroup measurements below when this directory is submitted. The published reference is the baseline; it was not timed locally on the full corpus.
+The submitted version is **v16**: one scan of the corpus in phases of about 32 MB. Each phase is indexed at document level (lists of 16-bit ids, bitmaps for common terms), every query is answered on that phase into a running tally, and the phase is then dropped (see [README.md](README.md)). The previous submission, v12 (commit `4d0be41`), is the only one with a board result so far: **T 0.217 s, M 41 MB, S 802, D 1, K 25.42, speed score 70.26** (rank 29 when recorded; its run ID was not noted). v16 has no board result yet.
 
-The selected implementation is v5: query-directed streaming C++20, adaptive sparse/bitmap Boolean postings, 16-bit local IDs with a 32-bit fallback, online token-trie phrase matching, short-token direct lookup, and eight workers. It has no external dependencies.
+The v13 restructuring borrows its overall plan from a Rust Track B program we studied (`trackb_refm.rs`): phases with 16-bit postings; phrase matches written as rows of a pseudo-term, so that a phrase query becomes a one-term lookup; per-query tallies owned by one thread at a time (no atomics on results); answering phase k − 1 on the threads that have run out of scan work in phase k; row chunks per shard, sorted by claim order instead of sorting rows; a futex barrier that spins first. Unlike that program, lookups stay exact. It compares 47 bits of a hash and accepts a rare false match, whereas v13–v16 verify every hit (see v15 below). v1–v5 are the earlier posting-list design and v6–v12 the block design, both kept below for the record.
 
 ## Environment and method
 
@@ -46,71 +46,96 @@ Times below are all observations from the indicated batches, in run order. The m
 v2 reduced the eight-worker peak from 200728 to approximately 135500 KiB. v4 reduced that again to approximately 105300 KiB. These memory changes are more consistent than the local wall-time differences. Eight workers were selected because the v5 batch had both a lower trimmed time and lower peak RSS than twelve locally. Revisit this choice on the scoring box.
 
 The SIMD experiment did not show a consistent enough benefit across batches to retain its additional code. It is preserved as v3 rather than described as an unconditional regression. No PGO was used.
+## v6–v12: query-directed scan with block-local evaluation
 
-## Final five-run result and K estimate
+v5 spent most of its time in `std::getline`, byte-at-a-time hashing, a `std::string` per dictionary slot and per-term posting vectors, and held ~100 MiB of postings. v6 onward never builds a global index: the corpus is scanned once and every query is answered on blocks of documents as they are scanned. Each row below is one tested step; all full seed-1 outputs matched `f86973c2…0927`.
 
-| Run | Wall seconds | Peak RSS KiB | Correct hash |
-|---:|---:|---:|---|
-| 1 | 1.77 | 102552 | Yes |
-| 2 | 1.00 | 102976 | Yes |
-| 3 | 0.99 | 102976 | Yes |
-| 4 | 0.95 | 102972 | Yes |
-| 5 | 0.85 | 103028 | Yes |
+Local measurements: same WSL2 laptop as above (Core Ultra 7 265U, 14 logical CPUs, hybrid P/E cores, 3.38 GHz TSC). Wall times are medians of interleaved runs (`dev-b/cmp.py`) unless a list is given; this machine's baseline drifts by ±15 % with thermal state, so only same-batch comparisons are meaningful. "Anon" is peak `RssAnon` polled by `dev-b/memwatch.py` (RSS would also count the mapped corpus in v6); "cgroup" is the container's `memory.peak` from `dev-b/dock.sh` (board sandbox flags, CPUs 0–11, the track's Dockerfile).
 
-Dropping the fastest and slowest gives **T = 0.980 s**. The maximum RSS is **105,500,672 bytes = 100.61 MiB**. These are local results; the coarse timing precision is insufficient to certify the harness's spread gate.
+| Version | Change | Wall s (14 thr) | Memory | Notes |
+|---|---|---|---|---|
+| v5 (same batch) | baseline | 0.84–0.86 | 103 MiB RSS | |
+| v6 | mmap, AVX2 bitmask tokenizer, exact 3-key buckets, prefetch ring; per-block (2048 docs) Boolean evaluation with small lists spilling to rows; guards and anchors from a 1/64 sample; phrases per document around anchors | 0.30, 0.30, 0.33 | 97 MiB anon | eval ≈ 400 M cycles/thread: every morsel ended a block (245 blocks × 12.5 k evals) |
+| v7 | `pread` 256 KiB chunks (mmap faults cost 64 ms single-thread, 18 ms on 14 threads); blocks span a thread's morsels via a segment table; D = 8192; hot terms renumbered to rows, cold terms as branch-free pairs + counting sort; shared atomic results | 0.36, 0.20, 0.21 | 135 MiB RSS | evals/thread 300 k → 60 k |
+| v8 | triggered queries evaluated in ascending order from a bitset; first list referenced, not copied; size-aware intersect/subtract | 0.17–0.19 | 124 MiB anon | list eval cycles halved |
+| v9 | pairs store only term ids with a 0 per new document; staggered per-thread start of the query sweep (instead of 7 MB of per-thread result arrays); fixed 16-wide bit extraction | 0.167–0.174 | 86 MiB anon | experiment: removing shared atomics saved 30–40 M cycles/thread, staggering recovers most |
+| v10 | D = 4096; cold-only dedupe array; reserved vectors; two-pass prefetched query parse | 0.163–0.177 | 59 MiB anon | D = 2048 / 4096 / 8192 at 12 thr: 37 / 46 / 64 MiB anon, same time within noise |
+| v11 | parallel query parse into a per-thread-sharded dictionary; tree thread spawn; parallel query read; `mallopt(M_MMAP_THRESHOLD)` (freeing the query buffer had raised glibc's dynamic threshold: +7 MiB); capacity reserved once (growth remaps, `munmap` = TLB shootdown on all cores); `PR_SET_THP_DISABLE` | 0.176–0.19 | 52 MiB anon (D = 4096) | serial parse 10 ms → ~1–3 ms of work per thread |
+| v12 = `main.cpp` | D = 2048, profiling removed, read buffer grows for over-long lines | median 0.176 | **cgroup 38–39 MiB** | container wall 182–211 ms |
 
-The official `static_axes.py` measured the working directory using the cached `speeddemon-static-cpp:latest` tools image: **S = 418** (410 C++ code lines after LLVM formatting, 8 Dockerfile lines), **D = 1**. Tools report scc 4.1.0 and clang-format 23.1.3. D is marked "declared, unverified" because this standard-library-only C++ build has no package manifest. The report is saved as [../dev-b/static-axes.json](../dev-b/static-axes.json); its commit field is the base checkout, and its notes correctly identify the uncommitted changes measured.
+Negative or neutral results kept for the record: branch-free union/difference (no change, the merges were not mispredict-bound); prefetch distance 16 vs 8 (no change); hot ratio N/64 vs N/32 (no change, kept 32); `MADV_HUGEPAGE` dictionary (dropped for THP safety, no measurable loss).
 
-Using the published anchors `T_ref=56.352376`, `M_ref=2199961600`, `S_ref=91`, `D_ref=1`, an **illustrative mixed-environment estimate** is:
+Single-thread profile of v11 (D = 4096, TSC cycles converted at 3.38 GHz): total 0.84 s; Boolean evaluation 0.23 s (1.25 M evaluations, list operands ~68 elements each); cold-pair counting sort 0.04 s; tokenizer stages measured separately (`dev-b/tokbench.cpp`): `pread` 26 ms, masks 4 ms, position extraction 50 ms, keys 38 ms for 36.5 M tokens; dictionary probes ~150 ms; per-token bookkeeping ~150 ms.
 
-```text
-K = (56.352376 / 0.980)^0.50
-  * min(2199961600 / 105500672, 50)^0.20
-  * min(91 / 418, 1)^0.15
-  * (1 / 1)^0.15
-  = 11.0753
-```
+v12 on the board: T 0.217 s, M 41 MB, S 802, K 25.42 (score 70.26). Profiling v12 afterwards (phase timers, `dev-b/prof_patch.py`) showed where the rest went: 12 threads scaled poorly (1 thread 0.97 s, 12 threads 0.26 s locally); evaluation at block end was 25 % of single-thread time and grew 2.3× at 12 threads (2.17 M evaluations, shared atomic results bouncing between cores); setup before the scan took 16 ms.
 
-**This is not a measured official K.** It combines a different CPU's wall time and process RSS with published scoring-box references. The board must supply the comparable T, cgroup M, official S, and run ID. No official points are reported.
+## v13–v16: phases, per-query tallies, exact 64-bit tags
 
-## Profiling observations
+The corpus is cut into phases of about 32 MB (8 at full scale, ~31,000 documents each; a phase is split further if it would exceed 65,535 documents, so ids within it always fit 16 bits). Threads take 256 KB claims of the current phase from a counter. Per token the scan stores the term's action; at the end of each 8 KB batch, list hits go to 64 row shards in 32-row chunks headed by their claim number, and heavy hits are applied to the phase's bitmaps once per group of 64 documents (atomically only for the first and last group of a claim, which a neighbouring claim may share). After a phase, each shard's chunks are sorted by claim, counted and written as lists (duplicates within a document dropped against the previous entry), and the other bitmap set is zeroed. Then the threads answer every query on that phase, 64 queries per job, into a tally (count, 64-bit sum, ten smallest ids) that only one thread touches at a time. Phases are answered in order, so the first ten ids come out sorted with no merge. The answers of phase k − 1 run on threads that have no claims of phase k left.
 
-An instrumented development copy of v2 at eight workers measured 1.138–1.698 s for each worker's scan/index/phrase phase, versus 0.057–0.065 s for Boolean queries and reduction. Each worker held about 9.16–9.20 MB of posting-vector capacity; 365–374 lists had promoted to bitmaps. The v3 instrumented batch measured 0.891–0.947 s scanning and 0.092–0.101 s querying. These batches were not isolated enough to infer a precise scanner speedup.
+Local measurements below are on the same laptop as above. It throttles under 12 threads and drifted by up to 2× during this session, so only interleaved comparisons in one batch are used. `dockcmp.sh` runs static binaries in the board's sandbox flags (CPUs 0–11, read-only, `/data` mounted) and reports the cgroup `memory.peak`. The Rust program is timed the same way as a yardstick, not as a submission. Single-thread cycle counts are TSC cycles (3.38 GHz) for the scan claims alone, taking the minimum of 7 interleaved runs (`dev-b/minrun.sh`).
 
-The useful next target is the scan and its allocations. A full positional index adds memory and construction work without being needed for the supplied query set. Narrow local IDs reduce sparse-posting storage while the bitmap switch prevents frequent terms from consuming long ID arrays. The query phase was already small, so further query machinery must justify its source-size penalty.
+| Version | Change | Result |
+|---|---|---|
+| v13 | phases, row shards, per-query tallies, pseudo-terms for phrases, futex barrier; dictionary of 7 32-bit tags per line with exact keys in a separate array; 64 × 64 bit transposition of heavy rows per group | correct first time (1 and 12 threads); 12 thr 0.26 s, no faster than v12 |
+| knobs on v13 (single thread) | removing the per-token heavy-bit read-modify-write saved 20 % of scan cycles: non-heavy tokens all wrote one dummy word, a serial store-forwarding chain; skipping the separate key check saved 13 % (a second cache line per hit) | led to v14 |
+| v14 | heavy hits buffered as (bitmap, doc) and applied per 64-document group, straight into the bitmaps (no transposition, no per-token RMW); three exact keys inline per line | single thread: scan 60 cycles/token (tokenize + key + hash 22, lookup 19, bookkeeping 19); container min 207 ms vs Rust program 165 ms, v12 233 ms; **47 MiB cgroup peak, over the 44 MB cap** |
+| prefetch tests on v14 | no prefetch +30 % scan cycles; prefetch 16 ahead −12 %; 16 KB batches with prefetch 16 −15 % | lookup latency matters |
+| v15 | the dictionary was 8 MB: shards were sized by term *occurrences*, and frequent words repeat thousands of times in the queries. Shards are now sized by distinct hashes (counted by each shard's owner after parsing), giving a 2 MB table at load ≤ 5/8. Four 64-bit tags per line; the hash of a key is a bijection of its first 8 bytes when the rest is empty, so for tokens up to 8 bytes an equal tag is an equal token; longer terms keep their second word beside the table and a bit in the line says to compare it; 17–32-byte terms also compare their tail. Parse buffers freed after interning; 16-bit sample counters; prefetch 16, 16 KB batches | 43.3 MiB cgroup peak |
+| **v16** = `main.cpp` | 8 KB batches (the per-thread token arrays scale with them), 32-row chunks (less half-empty space per claim), unpadded tallies | **37.5 MiB cgroup peak**; container min / median 173 / 179 ms vs v14 180 / 186 and Rust program 131 / 148 in the same batch; natively at 12 threads v14 / v15 / v16 medians 0.169 / 0.171 / 0.176 s, within noise |
 
-## Correctness and packaging checks
+Row volume at full scale: 1.63 M rows and 1.42 M postings per phase (cold-term occurrences, duplicates included). Setup at 12 threads takes 15–25 ms locally: query parse 1–4 ms, interning 3–8 ms (page faults under WSL2 are slow; a longer barrier spin did not help), sample 2–3 ms, plan 1–2 ms. The Rust program's setup measured 10–15 ms on the same machine.
 
-- All eight official hand-written test methods passed (seven execute the solution; one checks the spec example text).
-- 24 randomized corpora, each with 200 mixed Boolean/phrase queries, matched the frozen reference. Cases include 32-byte tokens, absent terms, uppercase, Unicode separator bytes, repeated terms, and mixed operators.
-- Generated tiny seeds 1, 2, 17 and sample seeds 1, 7 matched the reference at 1, 3, 8, and 12 requested workers: 20 executable comparisons.
-- The above 51 executable comparisons also passed under AddressSanitizer and UndefinedBehaviorSanitizer, built with `-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie`.
-- Additional 65,536-, 65,537-, and 131,073-document cases passed at 1, 3, and 8 workers with both the final release binary and the sanitizer binary. These nine cases exercise the representation boundary, partial bitmap words, and sums exceeding uint32. Thus the final algorithm has 60 differential cases, with the same coverage checked under sanitizers.
-- Full public seed 1 matched the published hash for every benchmark, including the exact container binary and its single-thread 32-bit fallback.
-- Offline Docker build succeeded from the digest-pinned allowlisted images. Final image size: 121,523,814 bytes.
-- Full-data container run succeeded with uid/gid 65534, `--network none`, `--read-only`, `--cap-drop ALL`, `no-new-privileges`, a 256-process limit, CPUs 0–11, and 4 GB memory with swap disabled. Only `results.txt` was produced in the output directory.
+## Current result and K estimate (v16)
 
-Final `main.cpp` SHA-256: `b3433575de7836b84a43ba90098982b2fdbfb0a49220f3edc06dce1c9c930f95`.
+| Measure | Value |
+|---|---|
+| Container wall (local, 12 CPUs) | min 173 ms, median 179 ms (v12 in an earlier batch: 233 / 340) |
+| Container `memory.peak` | 37.5 MiB (≈ 39 MB) |
+| S (official `static_axes.py`, cached tools image) | **905** (898 C++ + 7 Dockerfile) |
+| D | 1 |
+
+If the board's time falls as much as the local container time did from v12 (about 25 %), T would be about 0.16 s and K ≈ (56.352 / 0.16)^0.5 × 50^0.2 × (91 / 905)^0.15 ≈ 18.8 × 2.19 × 0.71 ≈ **29** (score ≈ 73). This is an estimate, not a result; the board decides.
+
+## Correctness and packaging checks (v16)
+
+- `dev-b/verify.py`, `dev-b/boundaries.py` (65,536 / 65,537 / 131,073 documents, which also forces phases to split below 65,536 documents) and `dev-b/extra.py`: all pass.
+- ASan + UBSan (`-fno-sanitize-recover`) on `extra.py`, `boundaries.py` and full seed 1; TSan on `extra.py`: all pass, no reports.
+- Fresh full-scale seed 2026: output identical to the reference (`bbd7e637…`).
+
+## Correctness and packaging checks (v12)
+
+- `dev-b/verify.py`: the 8 official hand-written tests, 24 randomized corpora × 200 mixed queries, generated tiny seeds 1, 2, 17 and sample seeds 1, 7 at 1, 3, 8 and 12 threads — 51 comparisons, all identical to the reference.
+- `dev-b/boundaries.py`: 65,536 / 65,537 / 131,073 documents at 1, 3, 8 threads (many blocks, sums beyond 32 bits).
+- `dev-b/extra.py`: 17–32-byte terms and corpus tokens of 33–64 bytes, a 400 KB line (buffer growth), an empty corpus, one document on 64 threads, 9,000 documents with results longer than ten, duplicate lines.
+- Fresh full-scale seed 2026 (generated locally, 609,815 distinct tokens): output identical to the reference (`bbd7e637…`).
+- The same suites under ASan + UBSan (`-fno-sanitize-recover`) and under TSan: all pass, no reports.
+- Five consecutive full seed-1 runs: identical hashes.
+- Offline Docker build from the pinned allowlisted images; runs read-only as uid 65534 with no network; only `results.txt` is written. The `mkdir -p /data /out` line was removed: the mounts work without it.
 
 ## Reproduction
 
-From `speed-demon-starter`, under Linux/WSL with the sibling `speed-demon-2026` checkout and generated `../data/track-b/full-seed1` present:
+From `speed-demon-starter`, under Linux/WSL with the sibling `speed-demon-2026` checkout and the seed-1 data copied to `/tmp/sd-track-b/data`:
 
 ```sh
-mkdir -p dev-b/bin dev-b/results
-g++ -std=c++20 -O3 -march=x86-64-v3 -pthread track-b/main.cpp -o dev-b/bin/local
-REPEATS=5 python3 dev-b/bench.py dev-b/bin/local 8 12
-python3 dev-b/verify.py dev-b/bin/local
-python3 dev-b/boundaries.py "$(realpath dev-b/bin/local)"
-docker build --network=none -t sd-track-b track-b
-python3 ../speed-demon-2026/harness/static_axes.py --track-dir track-b \
-  --tools-image speeddemon-static-cpp:latest --json dev-b/results/static.json
+cd dev-b
+bash mk.sh v16.cpp v16 && bash mk.sh v16.cpp v16s -static
+SD_THREADS=12 python3 cmp.py 9 bin/v14 bin/v16      # interleaved, hash-checked
+bash dockcmp.sh 5 bin/v16s                            # board sandbox flags: wall + memory.peak
+python3 prof13.py v16.cpp bin/v16p.cpp && bash mk.sh bin/v16p.cpp v16p && SD_THREADS=12 bin/v16p /tmp/sd-track-b/data /tmp/sd-track-b/out   # phase timers
+python3 verify.py bin/v16 && python3 boundaries.py "$(realpath bin/v16)" && python3 extra.py bin/v16
+# v12 and earlier:
+bash mk.sh v12.cpp v12                 # release flags of the Dockerfile
+python3 cmp.py 9 bin/v12               # interleaved median, hash-checked
+python3 memwatch.py bin/v12 /tmp/sd-track-b/data /tmp/sd-track-b/out
+bash dock.sh v12.cpp 3                 # container wall + memory.peak
+python3 verify.py bin/v12 && python3 boundaries.py "$(realpath bin/v12)" && python3 extra.py bin/v12
+bash mk.sh v11.cpp v11p -DPROF && SD_THREADS=1 bin/v11p /tmp/sd-track-b/data /tmp/sd-track-b/out   # phase profile
 ```
-
-`bench.py` copies the dataset to the Linux temporary directory before measuring and verifies every output hash. Its generated `results/bench.jsonl` is local scratch; the completed session's measurements are preserved separately in `measurements.jsonl`. Use the official pinned static-tools image when available for the definitive S count. `profile.py dev-b/v2.cpp` or `profile.py dev-b/v3.cpp` regenerates the instrumented experimental copy; profiling code is not part of the submission.
 
 ## Official submission results
 
 | Run ID | Commit | T (s) | Cgroup peak M | Official S / D | K | Gates |
 |---|---|---|---|---|---|---|
-| Pending submission | — | — | — | — | — | — |
+| not noted (v12) | `4d0be41` | 0.217 | 41 MB | 802 / 1 | 25.42 (score 70.26) | passed |
+| pending (v16) | — | — | — | — | — | — |
