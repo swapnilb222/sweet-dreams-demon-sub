@@ -190,6 +190,22 @@ Each idea was measured against the version before it and dropped when it did not
 
 ---
 
+## Sizes checked against the scoring machine's caches
+
+Our laptop has a 12 MB last-level cache, and the i5-13500 has 24 MB, so we checked whether our sizes were tuned to the wrong cache. Valgrind's cache simulator ran the full input with the target's caches (48 KB L1 data, 24 MB last level). We turned its counts into cycles with a rough model for a 2.5 GHz core: 2.5 instructions per cycle, 30 cycles for an L1 miss that hits a lower cache, and 200 cycles for a miss that goes to memory.
+
+| Variant | Estimated cycles vs current |
+|---|---:|
+| Current code with a 12 MB cache, like the laptop | +6.1% |
+| No chain contraction | +18.2% |
+| Blob 2,048 / 8,192 nodes (current 512) | +3.1% / +4.4% |
+| Bucket width 32 / 128 (current 64) | +3.0% / -0.1% |
+| Chain-walk batch 4 / 16 (current 8) | about -2% / -1%, within the simulation's own noise |
+| Blob 64 nodes, three runs each | -2.7%, from 6% fewer L1 misses |
+| Blob 32 nodes | the same as 64 |
+
+So the smaller laptop cache exaggerates memory costs by about 6%, but it did not mislead the big decisions: contraction is still clearly worth it on a 24 MB cache. The one promising size, 64-node blobs, lost 2 to 3 ms in two rounds of 20 interleaved wall-clock runs. The simulator counts misses but cannot see how many of them the processor overlaps, and smaller blobs restart the chain walks' prefetch pipeline more often. So we kept 512.
+
 ## How we measured
 
 **The scoring machine.** It is an Intel i5-13500. Timed runs get its six P-cores with hyperthreading (12 threads), turbo off and a fixed clock of about 2.5 GHz. The input sits in the page cache before the clock starts, and memory is capped at 8 GB without swap.
